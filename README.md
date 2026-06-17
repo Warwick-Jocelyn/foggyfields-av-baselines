@@ -46,6 +46,7 @@ foggyfields-av-baselines/
 ├── README.md                ← you are here
 ├── REPRODUCE.md             ← master step-by-step reproduce guide (READ THIS)
 ├── RESULTS.md               ← results report: PSNR/SSIM/LPIPS/LiDAR, time, iterations, best ckpt
+├── DATASET_NOTES.md         ← ⚠️ clip lighting/weather: which clips are NIGHT (PandaSet 078!)
 ├── CHECKPOINTS.md           ← HuggingFace model/dataset manifest (what to download)
 ├── BASE_COMMITS.txt         ← exact upstream commits to clone
 ├── patches/

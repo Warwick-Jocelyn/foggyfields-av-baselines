@@ -53,16 +53,21 @@ integration handles depth better.
 
 ## 2. PandaSet — reference runs (clips 011, 078; 50/50 split, paper-faithful)
 
-| Clip | Method | PSNR↑ | SSIM↑ | LPIPS↓ |
-|---|---|---|---|---|
-| 011 | SplatAD | 27.52 | 0.868 | 0.162 |
-| | NeuRAD | 26.46 | 0.805 | 0.201 |
-| | EmerNeRF | 27.55 | 0.790 | n/a |
-| 078 | SplatAD | 31.65 | 0.930 | 0.242 |
-| | NeuRAD | 30.04 | 0.898 | 0.214 |
-| | EmerNeRF | 31.26 | 0.879 | n/a |
+> ⚠️ **Lighting differs between the two PandaSet clips** (see `DATASET_NOTES.md`):
+> **011 = daytime** (`011-1`), **078 = NIGHTTIME** (`078_night_1`). Both are fog-free,
+> so they isolate the *no-fog* baseline — but 078's higher numbers are a **night** scene,
+> not directly comparable to the daytime 011.
 
-(EmerNeRF PandaSet tfevents log PSNR+SSIM only. On clear-weather PandaSet the three methods
+| Clip | Lighting | Method | PSNR↑ | SSIM↑ | LPIPS↓ |
+|---|---|---|---|---|---|
+| 011 | **day** | SplatAD | 27.52 | 0.868 | 0.162 |
+| | | NeuRAD | 26.46 | 0.805 | 0.201 |
+| | | EmerNeRF | 27.55 | 0.790 | n/a |
+| 078 | **night** | SplatAD | 31.65 | 0.930 | 0.242 |
+| | | NeuRAD | 30.04 | 0.898 | 0.214 |
+| | | EmerNeRF | 31.26 | 0.879 | n/a |
+
+(EmerNeRF PandaSet tfevents log PSNR+SSIM only. On fog-free PandaSet the three methods
 are close — SplatAD slightly ahead on SSIM/LPIPS — confirming the implementations are sound
 and that the large EmerNeRF lead on NVIDIA_AV_Fog is a *fog*-specific effect.)
 
@@ -112,8 +117,9 @@ nerfstudio checkpoint requires its sibling `config.yml` to load.
 
 - **EmerNeRF dominates RGB in fog** (mean ~33 dB vs NeuRAD ~29, SplatAD ~23) — its
   volumetric RGB+LiDAR integration models participating media better than discrete
-  Gaussians. On clear-weather PandaSet the gap vanishes, so this is a **fog-specific**
-  finding, not an implementation artifact.
+  Gaussians. On fog-free PandaSet the gap vanishes, so this is a **fog-specific**
+  finding, not an implementation artifact. (Note PandaSet 078 is a *night* scene — see
+  `DATASET_NOTES.md`.)
 - **NeuRAD wins LiDAR depth** on every fog clip (median 5–9 m vs SplatAD 8–15 m).
 - **SplatAD is 8–13× faster** to train (~40 min vs 4–6 h) — its trade-off is fog fidelity.
 - Difficulty tracks fog × speed: clip 002 (rural, 113 km/h, medium fog) is hardest;
