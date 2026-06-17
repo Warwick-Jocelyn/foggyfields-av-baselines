@@ -82,6 +82,19 @@ NVIDIA_AV_Fog, mean over clips 002/003/004 — full table in [`RESULTS.md`](RESU
 
 † EmerNeRF NVIDIA numbers are **pending re-train** — see the split-fix note below.
 
+## Qualitative — PandaSet multi-camera comparison (fog-free reference)
+
+Held-out novel-view renders, all cameras at once (GT vs each method). Day vs night:
+
+**Clip 011 — daytime**
+![PandaSet 011 day](assets/pandaset_011_day.jpg)
+
+**Clip 078 — nighttime** (see `DATASET_NOTES.md`)
+![PandaSet 078 night](assets/pandaset_078_night.jpg)
+
+SplatAD / NeuRAD share the nerfstudio 6-camera panorama layout; EmerNeRF uses its own
+camera arrangement (labelled). Full per-clip videos: `Code/outputs/.../videos/val/panorama_rgb.mp4`.
+
 ---
 
 ## ⚠️ Important: EmerNeRF eval-split fix (must re-train EmerNeRF)

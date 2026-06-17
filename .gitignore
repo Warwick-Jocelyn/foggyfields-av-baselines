@@ -31,3 +31,8 @@ processed/
 
 # keep metric JSONs even though they're small results
 !results/metrics/**/*.json
+
+# keep figure assets
+!assets/
+!assets/*.png
+!assets/*.jpg
