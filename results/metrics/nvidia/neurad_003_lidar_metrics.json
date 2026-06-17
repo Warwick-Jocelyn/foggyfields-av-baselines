@@ -1,0 +1,16 @@
+{
+  "method": "neurad",
+  "seq": "003",
+  "num_points": 1530870,
+  "depth_l1_mean_m": 13.052745989598298,
+  "depth_l1_median_m": 7.492484061467019,
+  "depth_rmse_m": 22.73166687188599,
+  "acc_at_1m": 0.07633110584177624,
+  "acc_at_2m": 0.1731557872320968,
+  "acc_at_5m": 0.36096990600116274,
+  "per_camera_median_m": {
+    "camera_cross_right_120fov": 7.162489540640527,
+    "camera_rear_left_70fov": 35.95605013762656,
+    "camera_rear_tele_30fov": 42.74018154142908
+  }
+}

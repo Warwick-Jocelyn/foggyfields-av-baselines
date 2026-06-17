@@ -1,0 +1,33 @@
+# ---- large / regenerable artifacts (live on HuggingFace, not git) ----
+*.ckpt
+*.pth
+*.pt
+*.mp4
+*.npy
+*.npy.gz
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.log
+*.tfevents.*
+events.out.*
+
+# ---- run / cache dirs ----
+wandb/
+outputs/
+renders/
+renders_rawdepth/
+nerfstudio_models/
+test_videos/
+__pycache__/
+*.pyc
+.cache/
+.ipynb_checkpoints/
+
+# ---- processed dataset (lives on HuggingFace, gated) ----
+processed/
+*/processed_pinhole/
+
+# keep metric JSONs even though they're small results
+!results/metrics/**/*.json

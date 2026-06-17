@@ -1,0 +1,54 @@
+# PandaSet config — paper-default EmerNeRF: RGB + LiDAR depth supervision
+# (matches the configuration EmerNeRF's Table 1/3 PSNR numbers were produced with)
+# Inherits from default_config.yaml at CLI time.
+
+data:
+  data_root: /networkhome/WMGDS/wang3_y/ETH/Code/SplatAD/dataset
+  dataset: pandaset
+  scene_idx: 11
+  start_timestep: 0
+  end_timestep: -1
+  ray_batch_size: 8192
+  preload_device: cuda
+  pixel_source:
+    load_size: [540, 960]
+    downscale: 1
+    num_cams: 6                    # L, FL, F, FR, R, BACK — full SplatAD-equivalent observation budget
+    test_image_stride: 2
+    load_rgb: True
+    load_sky_mask: False
+    load_dynamic_mask: False
+    load_features: False
+    skip_feature_extraction: True
+    target_feature_dim: 64
+    feature_model_type: dinov2_vitb14
+    feature_extraction_stride: 7
+    feature_extraction_size: [644, 966]
+    delete_features_after_run: False
+    sampler:
+      buffer_downscale: 16
+      buffer_ratio: 0.25
+  lidar_source:
+    load_lidar: True               # ENABLE LiDAR — used for depth + line-of-sight supervision
+    only_use_top_lidar: True       # PandaSet pandar64 top (d=1) only; skip pandar GT front strip
+    truncated_max_range: 80
+    truncated_min_range: -2
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02
+  occ_source:
+    voxel_size: 0.1
+
+nerf:
+  model:
+    num_cams: 6
+    head:
+      enable_dynamic_branch: True
+      enable_flow_branch: True
+      enable_shadow_head: True
+
+# supervision.depth.enable is True by default; the line-of-sight loss schedule
+# is inherited from default_config.yaml (start_iter=2000, eps 6.0→2.5 over 5000 steps).
+
+eval:
+  eval_lidar_flow: False           # no GT flow on PandaSet
+  remove_ground_when_eval_lidar_flow: True

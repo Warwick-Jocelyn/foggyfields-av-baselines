@@ -1,0 +1,55 @@
+# PandaSet config — RGB-only EmerNeRF with full dynamic + flow branches enabled
+# (the paper's headline configuration; matches SplatAD's 6-camera observation budget)
+# Inherits structure from default_config.yaml; only the keys we override are listed here
+# (full keys are still pulled from default_config.yaml at CLI time via --config_file).
+
+data:
+  data_root: /networkhome/WMGDS/wang3_y/ETH/Code/SplatAD/dataset
+  dataset: pandaset                # routes to PandaSetDataset in train_emernerf.py
+  scene_idx: 11                    # overridden per-scene via CLI
+  start_timestep: 0
+  end_timestep: -1
+  ray_batch_size: 8192
+  preload_device: cuda
+  pixel_source:
+    load_size: [540, 960]          # PandaSet native is 1080x1920 → 50% downscale
+    downscale: 1
+    num_cams: 6                    # L, FL, F, FR, R, BACK — matches SplatAD's observation budget
+    test_image_stride: 2           # = SplatAD/NeuRAD train_split_fraction=0.5 (every other frame to val)
+    load_rgb: True
+    load_sky_mask: False           # PandaSet ships semseg but we skip for first pass
+    load_dynamic_mask: False
+    load_features: False
+    skip_feature_extraction: True
+    target_feature_dim: 64
+    feature_model_type: dinov2_vitb14
+    feature_extraction_stride: 7
+    feature_extraction_size: [644, 966]
+    delete_features_after_run: False
+    sampler:
+      buffer_downscale: 16
+      buffer_ratio: 0.25
+  lidar_source:
+    load_lidar: False              # RGB-only run per user spec
+    only_use_top_lidar: False
+    truncated_max_range: 80
+    truncated_min_range: -2
+    lidar_downsample_factor: 4
+    lidar_percentile: 0.02
+  occ_source:
+    voxel_size: 0.1
+
+nerf:
+  model:
+    num_cams: 6                    # must match data.pixel_source.num_cams
+    head:
+      # ======= EmerNeRF core contributions =======
+      # Per default_flow.yaml: enable dynamic + flow + shadow heads together
+      # (these are the paper's core self-supervised scene decomposition)
+      enable_dynamic_branch: True  # 4D (x,y,z,t) hash for time-varying density/RGB
+      enable_flow_branch: True     # learns 6-DoF scene flow self-supervised (cycle consistency)
+      enable_shadow_head: True     # shadow ratio cast by dynamic actors on static surfaces
+
+eval:
+  eval_lidar_flow: False           # we have no LiDAR; skip the lidar-flow eval (Waymo-only)
+  remove_ground_when_eval_lidar_flow: True

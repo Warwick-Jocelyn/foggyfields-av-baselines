@@ -1,0 +1,7 @@
+{
+  "num_images": 693,
+  "psnr": 29.101576820252433,
+  "ssim": 0.8971111989468551,
+  "lpips": 0.16093558652533424,
+  "source": "rendered val PNGs (rgb vs gt-rgb)"
+}

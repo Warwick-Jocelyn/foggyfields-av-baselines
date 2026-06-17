@@ -1,0 +1,20 @@
+{
+  "method": "splatad",
+  "seq": "002",
+  "num_points": 34964823,
+  "depth_l1_mean_m": 12.521298937336427,
+  "depth_l1_median_m": 8.15384563781246,
+  "depth_rmse_m": 19.169807655479627,
+  "acc_at_1m": 0.06083005196394101,
+  "acc_at_2m": 0.12170068757390821,
+  "acc_at_5m": 0.3094994074473078,
+  "per_camera_median_m": {
+    "camera_front_wide_120fov": 6.0497693114902,
+    "camera_cross_left_120fov": 8.762673582524396,
+    "camera_cross_right_120fov": 6.440153637104578,
+    "camera_rear_left_70fov": 10.335271933018248,
+    "camera_rear_right_70fov": 8.949601763689119,
+    "camera_front_tele_30fov": 31.289802605317096,
+    "camera_rear_tele_30fov": 31.609518889454883
+  }
+}

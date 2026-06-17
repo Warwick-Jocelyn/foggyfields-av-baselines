@@ -1,0 +1,4 @@
+=== base commits ===
+neurad-studio  e6f7e4e509b828a952d8584b7165f7844711ecb2  https://github.com/georghess/neurad-studio.git
+splatad  6e31ad766d39e0c33f9034a2ed772d51364b2343  https://github.com/carlinds/splatad.git
+EmerNeRF  8c051d7cccbad3b52c7b11a519c971b8ead97e1a  https://github.com/NVlabs/EmerNeRF.git

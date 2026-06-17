@@ -1,0 +1,516 @@
+# Copyright 2024 the authors of NeuRAD and contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Data parser for the NVIDIA_AV_Fog dataset (5 fog-daytime clips derived from NVIDIA NCore).
+
+Layout expected under ``--data``::
+
+    <data>/
+      processed/
+        002_<uuid>_fog_day_rural/processed_pinhole/{images,lidar,labels,splits,calib,...}
+        003_<uuid>_fog_day_residual/processed_pinhole/...
+        004_<uuid>_fog_day_highway_with_cars/processed_pinhole/...
+        ...
+
+Use ``--sequence`` to pick a clip (matched by leading-digit prefix or by uuid prefix,
+e.g. ``002`` or ``b9ea7a9d``).
+"""
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Literal, Tuple, Type
+
+import numpy as np
+import pandas as pd
+import torch
+
+from nerfstudio.cameras.cameras import Cameras, CameraType
+from nerfstudio.cameras.lidars import Lidars, LidarType
+from nerfstudio.data.dataparsers.ad_dataparser import (
+    DUMMY_DISTANCE_VALUE,
+    OPENCV_TO_NERFSTUDIO,
+    ADDataParser,
+    ADDataParserConfig,
+)
+
+# Camera order is fixed; sensor_idx is the index into this tuple.
+NVIDIA_AV_FOG_CAMERAS: Tuple[str, ...] = (
+    "camera_front_wide_120fov",
+    "camera_cross_left_120fov",
+    "camera_cross_right_120fov",
+    "camera_rear_left_70fov",
+    "camera_rear_right_70fov",
+    "camera_front_tele_30fov",
+    "camera_rear_tele_30fov",
+)
+
+NVIDIA_AV_FOG_LIDAR: str = "lidar_top_360fov"
+
+# NCore native rig: +x=left, +y=forward, +z=up.
+# ISO 8855:        +x=forward, +y=left,    +z=up.
+# Rotation that takes a point's NCore-frame coords to ISO coords:
+#     p_iso = R_iso_from_ncore @ p_ncore
+# Derivation:
+#     x_iso (fwd)  = y_ncore (fwd)
+#     y_iso (left) = x_ncore (left)
+#     z_iso (up)   = z_ncore (up)
+R_ISO_FROM_NCORE = np.array(
+    [[0.0, 1.0, 0.0],
+     [1.0, 0.0, 0.0],
+     [0.0, 0.0, 1.0]],
+    dtype=np.float64,
+)
+
+# NCore LiDAR sweep `[N,6]` columns: x, y, z, intensity (already 0-1), t_offset_us, ring_id.
+LIDAR_SWEEP_COL_X = 0
+LIDAR_SWEEP_COL_INTENSITY = 3
+LIDAR_SWEEP_COL_T_OFFSET_US = 4
+LIDAR_SWEEP_COL_RING_ID = 5
+
+# Allowed NCore obstacle classes. NCore auto-labels v2 surface these for the fog clips:
+#   automobile, trailer, heavy_truck, bus, motorcycle, bicycle, ... (pedestrian/two-wheeler rare)
+NVIDIA_AV_FOG_ALLOWED_RIGID_CLASSES: Tuple[str, ...] = (
+    "automobile",
+    "trailer",
+    "heavy_truck",
+    "bus",
+    "other_vehicle",
+    "motorcycle",
+    "bicycle",
+    "train",
+    "trolley",
+    "tram",
+)
+NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES: Tuple[str, ...] = (
+    "pedestrian",
+    "person",
+    "two_wheeler",
+)
+
+# Sensor specs for the NCore 128-line top LiDAR. Beam divergences are not published
+# by NVIDIA; we reuse the Pandar64 values as conservative defaults. They only matter
+# for `add_missing_points` (which is off by default) and for ray-drop modeling.
+HORIZONTAL_BEAM_DIVERGENCE = 3e-3
+VERTICAL_BEAM_DIVERGENCE = 1.5e-3
+
+
+@dataclass
+class NvidiaAvFogDataParserConfig(ADDataParserConfig):
+    """Config for the NVIDIA_AV_Fog dataparser.
+
+    The dataset is the user's 5-clip foggy multimodal release derived from NVIDIA
+    NCore / PhysicalAI-AV. 7 rectified-pinhole cameras + one 128-line spinning LiDAR,
+    199 timesteps over ~20s per clip. See ``KNOWN_ISSUES.md`` in the dataset for the
+    NCore-rig convention (this dataparser converts to ISO 8855).
+    """
+
+    _target: Type = field(default_factory=lambda: NvidiaAvFog)
+    data: Path = Path("/networkhome/WMGDS/wang3_y/ETH/Dataset/NVIDIA_AV_Fog")
+    """Root of the NVIDIA_AV_Fog dataset (contains processed/<clip>/...)."""
+    sequence: str = "002"
+    """Clip prefix or uuid prefix selecting a clip under processed/."""
+
+    cameras: Tuple[
+        Literal[
+            "camera_front_wide_120fov",
+            "camera_cross_left_120fov",
+            "camera_cross_right_120fov",
+            "camera_rear_left_70fov",
+            "camera_rear_right_70fov",
+            "camera_front_tele_30fov",
+            "camera_rear_tele_30fov",
+            "none",
+            "all",
+        ],
+        ...,
+    ] = NVIDIA_AV_FOG_CAMERAS
+    """Which cameras to use. ``("all",)`` expands to all 7."""
+
+    lidars: Tuple[Literal["lidar_top_360fov", "none"], ...] = (NVIDIA_AV_FOG_LIDAR,)
+    """Which lidars to use. Currently only the 360° top lidar is present."""
+
+    annotation_interval: float = 0.1
+    """Interval between annotations in seconds (10 Hz from LiDAR-driven sync)."""
+
+    min_lidar_dist: Tuple[float, float, float] = (1.0, 2.0, 2.0)
+    """Drop points closer than this (sensor frame). Conservative defaults for ego."""
+
+    # NCore ftheta -> pinhole rectification is per-frame near-instantaneous from the
+    # dataset's perspective (we already have pinhole frames on disk). The rolling-shutter
+    # time and time-to-center-pixel for the source ftheta cameras are not published; we
+    # leave them at zero (treat as global-shutter). This is consistent with how the
+    # rectified pinhole frames are produced.
+    rolling_shutter_time: float = 0.0
+    time_to_center_pixel: float = 0.0
+
+    apply_iso_8855_rotation: bool = False
+    """If True, apply ``R_iso_from_ncore`` to all world-frame poses (cam, lidar, cuboid).
+    The processed_pinhole/ data is already in ISO 8855 (T_rig_world translation
+    grows along world +x = forward; obstacles_3d_world is in the same world frame),
+    so the default is now False. KNOWN_ISSUES I-003 refers to obstacles_3d_*ego*.parquet
+    only — we read the _world_ variant."""
+
+    splits_json: Literal["reconstruction_all", "nvs_50_50", "nvs_80_20", "nvs_90_10", "auto"] = "auto"
+    """If not 'auto', read ``processed_pinhole/splits/<name>.json`` directly. Otherwise
+    defer to the parent class' LINSPACE split (which matches ``nvs_50_50`` for
+    ``train_split_fraction=0.5``)."""
+
+    include_deformable_actors: bool = False
+
+
+@dataclass
+class NvidiaAvFog(ADDataParser):
+    """NVIDIA_AV_Fog DataParser."""
+
+    config: NvidiaAvFogDataParserConfig
+
+    # Populated in _generate_dataparser_outputs() before the parent runs:
+    clip_root: Path = Path()  # processed_pinhole/ for the chosen sequence
+    K_per_cam: Dict[str, Dict] = field(default_factory=dict)
+    T_camera_rig: Dict[str, np.ndarray] = field(default_factory=dict)   # 4x4, p_cam = T @ p_ego
+    T_lidar_rig: np.ndarray = field(default_factory=lambda: np.eye(4))  # 4x4, p_lidar = T @ p_ego
+    T_rig_world: np.ndarray = field(default_factory=lambda: np.zeros((0, 4, 4)))  # [T,4,4] p_world = T @ p_ego
+    timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds
+    num_timesteps: int = 0
+    # Per-camera/lidar metadata for split lookup:
+    _cam_timestep: List[int] = field(default_factory=list)
+    _lidar_timestep: List[int] = field(default_factory=list)
+
+    # ----- World-frame conventions ------------------------------------------------
+
+    @property
+    def _world_rotation(self) -> np.ndarray:
+        """4x4 transform: world_iso = R_iso_from_world @ world_ncore (identity if disabled)."""
+        if not self.config.apply_iso_8855_rotation:
+            return np.eye(4)
+        T = np.eye(4)
+        T[:3, :3] = R_ISO_FROM_NCORE
+        return T
+
+    # ----- Dataset entrypoint ----------------------------------------------------
+
+    def _generate_dataparser_outputs(self, split="train"):
+        # Resolve clip directory by prefix match. On ns-eval the reloaded config
+        # can come back with data=None (nerfstudio resets the top-level Config.data
+        # to None and does not repopulate the dataparser field), so fall back to the
+        # config field's default dataset root.
+        data_root = self.config.data
+        if data_root is None:
+            data_root = type(self.config).__dataclass_fields__["data"].default
+        self.clip_root = _resolve_clip_root(data_root, self.config.sequence)
+        # Load all calibration once.
+        self.K_per_cam = json.loads((self.clip_root / "calib" / "K_rectified.json").read_text())
+        T_cam_raw = json.loads((self.clip_root / "calib" / "T_camera_rig.json").read_text())
+        self.T_camera_rig = {k: _list_to_4x4(v) for k, v in T_cam_raw.items()}
+        T_lid_raw = json.loads((self.clip_root / "calib" / "T_lidar_rig.json").read_text())
+        self.T_lidar_rig = _list_to_4x4(T_lid_raw[NVIDIA_AV_FOG_LIDAR])
+        # Load per-timestep ego pose.
+        pose_df = pd.read_parquet(self.clip_root / "calib" / "T_rig_world.parquet")
+        pose_df = pose_df.sort_values("timestep_idx").reset_index(drop=True)
+        T = len(pose_df)
+        Trw = np.tile(np.eye(4)[None, :, :], (T, 1, 1)).astype(np.float64)
+        for r in range(3):
+            for c in range(4):
+                Trw[:, r, c] = pose_df[f"T_rig_world_{r}{c}"].to_numpy()
+        self.T_rig_world = Trw
+        self.timestamps_us = pose_df["timestamp_us"].to_numpy().astype(np.int64)
+        self.num_timesteps = T
+        # If a fixed split file was requested, load timestep indices for it.
+        self._train_timesteps, self._eval_timesteps = self._load_split_indices()
+        return super()._generate_dataparser_outputs(split)
+
+    # ----- ADDataParser overrides -------------------------------------------------
+
+    def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
+        cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
+        Rwrot = self._world_rotation  # 4x4
+
+        intrinsics: List[np.ndarray] = []
+        c2ws: List[np.ndarray] = []
+        heights: List[int] = []
+        widths: List[int] = []
+        times: List[float] = []
+        sensor_idxs: List[int] = []
+        image_filenames: List[Path] = []
+        timestep_record: List[int] = []
+
+        for t in range(self.num_timesteps):
+            T_rig_world_t = Rwrot @ self.T_rig_world[t]  # 4x4
+            ts_seconds = float(self.timestamps_us[t]) * 1e-6
+            for slot, cam_name in enumerate(cams):
+                K_info = self.K_per_cam[cam_name]
+                K = np.array([
+                    [K_info["fx"], 0.0,           K_info["cx"]],
+                    [0.0,          K_info["fy"],  K_info["cy"]],
+                    [0.0,          0.0,           1.0],
+                ], dtype=np.float64)
+                # T_camera_rig.json stores T_rig_from_camera (i.e. cam->rig) despite the
+                # "T_sensor_from_ego" convention string in the sibling lidar file. Verified by
+                # physical sanity: file translation column = camera position in rig (+x fwd, +z up)
+                # places front cams at (1.95, ~0, 1.32) m (windshield) and rear cams behind axles;
+                # inverting puts cameras 1.9 m underground. So use the matrix directly.
+                cam_to_rig = self.T_camera_rig[cam_name]
+                c2w = T_rig_world_t @ cam_to_rig
+                # OpenCV (x-right, y-down, z-fwd) -> NeRFStudio (x-right, y-up, z-back).
+                c2w[:3, :3] = c2w[:3, :3] @ OPENCV_TO_NERFSTUDIO
+
+                intrinsics.append(K)
+                c2ws.append(c2w)
+                widths.append(int(K_info["w"]))
+                heights.append(int(K_info["h"]))
+                times.append(ts_seconds)
+                sensor_idxs.append(slot)
+                timestep_record.append(t)
+                image_filenames.append(self.clip_root / "images" / cam_name / f"frame_{t:04d}.jpg")
+
+        intrinsics_t = torch.tensor(np.stack(intrinsics), dtype=torch.float32)
+        c2ws_t = torch.tensor(np.stack(c2ws), dtype=torch.float32)
+        times_t = torch.tensor(times, dtype=torch.float64)
+        idxs_t = torch.tensor(sensor_idxs, dtype=torch.int32).unsqueeze(-1)
+        heights_t = torch.tensor(heights, dtype=torch.int32).unsqueeze(-1)
+        widths_t = torch.tensor(widths, dtype=torch.int32).unsqueeze(-1)
+
+        self._cam_timestep = timestep_record
+        # NOTE: do not pass distortion_params here. Images are pinhole-rectified
+        # already (K_rectified.json: distortion=none). Passing a zeros tensor
+        # actually TRIGGERS the cv2.undistort path in full_images_datamanager —
+        # leaving it unset (None) is what causes the path to be skipped.
+        cameras = Cameras(
+            fx=intrinsics_t[:, 0, 0],
+            fy=intrinsics_t[:, 1, 1],
+            cx=intrinsics_t[:, 0, 2],
+            cy=intrinsics_t[:, 1, 2],
+            height=heights_t,
+            width=widths_t,
+            camera_to_worlds=c2ws_t[:, :3, :4],
+            camera_type=CameraType.PERSPECTIVE,
+            times=times_t,
+            metadata={
+                "sensor_idxs": idxs_t,
+                "timesteps": torch.tensor(timestep_record, dtype=torch.int32).unsqueeze(-1),
+            },
+        )
+        return cameras, image_filenames
+
+    def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
+        Rwrot = self._world_rotation
+        # T_lidar_rig.json also stores T_rig_from_lidar (= lidar->rig); see camera comment above.
+        # Translation (1.14, 0, 1.94) m = lidar position on rig (roof-mounted, forward of center).
+        lidar_to_rig = self.T_lidar_rig
+        poses, times, idxs, filenames, timestep_record = [], [], [], [], []
+        for t in range(self.num_timesteps):
+            T_rig_world_t = Rwrot @ self.T_rig_world[t]
+            l2w = T_rig_world_t @ lidar_to_rig
+            ts_seconds = float(self.timestamps_us[t]) * 1e-6
+            poses.append(l2w)
+            times.append(ts_seconds)
+            idxs.append(0)  # only one lidar
+            timestep_record.append(t)
+            filenames.append(self.clip_root / "lidar" / f"sweep_{t:04d}.npy")
+        poses_t = torch.tensor(np.stack(poses), dtype=torch.float32)
+        times_t = torch.tensor(times, dtype=torch.float64)
+        idxs_t = torch.tensor(idxs, dtype=torch.int32).unsqueeze(-1)
+        self._lidar_timestep = timestep_record
+        lidars = Lidars(
+            lidar_to_worlds=poses_t[:, :3, :4],
+            lidar_type=LidarType.PANDAR64,  # closest enum; affects ray-drop only
+            times=times_t,
+            metadata={
+                "sensor_idxs": idxs_t,
+                "timesteps": torch.tensor(timestep_record, dtype=torch.int32).unsqueeze(-1),
+            },
+            horizontal_beam_divergence=HORIZONTAL_BEAM_DIVERGENCE,
+            vertical_beam_divergence=VERTICAL_BEAM_DIVERGENCE,
+            valid_lidar_distance_threshold=DUMMY_DISTANCE_VALUE / 2,
+        )
+        return lidars, filenames
+
+    def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[torch.Tensor]:
+        """Returns one [N, 5] tensor per lidar frame: x, y, z, intensity, t_offset (sec).
+        Points are already in ego (== sensor==ego since lidar≈rig) frame on disk, so
+        no world->sensor transform is needed — but we still apply T_lidar_rig to express
+        them in the actual lidar-sensor frame the ADDataParser expects.
+        """
+        # self.T_lidar_rig is T_rig_from_lidar (lidar->rig); invert to get rig->lidar so we can
+        # transform sweep points from ego(=rig) frame into actual lidar-sensor frame.
+        T_lid_from_rig = torch.tensor(np.linalg.inv(self.T_lidar_rig), dtype=torch.float64)
+        Rrig = T_lid_from_rig[:3, :3].float()
+        trig = T_lid_from_rig[:3, 3].float()
+        point_clouds = []
+        for f in filenames:
+            sweep = np.load(f)  # [N, 6] float32
+            xyz_ego = torch.from_numpy(sweep[:, 0:3]).float()
+            # Ego -> lidar-sensor frame (lidar_to_rig = identity-ish but be safe).
+            xyz_sensor = (Rrig @ xyz_ego.T).T + trig
+            intensity = torch.from_numpy(sweep[:, LIDAR_SWEEP_COL_INTENSITY:LIDAR_SWEEP_COL_INTENSITY + 1]).float()
+            t_offset_s = torch.from_numpy(
+                sweep[:, LIDAR_SWEEP_COL_T_OFFSET_US:LIDAR_SWEEP_COL_T_OFFSET_US + 1].astype(np.float32) * 1e-6
+            )
+            pc = torch.cat([xyz_sensor, intensity, t_offset_s], dim=-1)  # [N, 5]
+            point_clouds.append(pc)
+        # ADDataParser._adjust_times will rebase pc[:, 4] -= 0 if the column is already
+        # an offset (which it is — relative to sweep center). Nothing else to do.
+        lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
+        return point_clouds
+
+    def _get_actor_trajectories(self) -> List[Dict]:
+        """Read obstacles_3d_world.parquet and emit per-track trajectories.
+
+        Per-track dict: poses [T,4,4] (world), timestamps [T] (seconds), dims [3] (wlh),
+        label (str), stationary (bool), symmetric (bool), deformable (bool).
+        """
+        df_path = self.clip_root / "labels" / "obstacles_3d_world.parquet"
+        if not df_path.exists():
+            return []
+        df = pd.read_parquet(df_path)
+        if not len(df):
+            return []
+        Rwrot = self._world_rotation[:3, :3]
+        twrot = self._world_rotation[:3, 3]
+
+        allowed = set(NVIDIA_AV_FOG_ALLOWED_RIGID_CLASSES)
+        if self.config.include_deformable_actors:
+            allowed |= set(NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES)
+        df = df[df["label_class"].str.lower().isin(allowed)]
+        if not len(df):
+            return []
+
+        ts_seconds = self.timestamps_us.astype(np.float64) * 1e-6
+        trajectories: List[Dict] = []
+        for track_id, g in df.groupby("track_id"):
+            g = g.sort_values("timestep_idx")
+            ti = g["timestep_idx"].to_numpy().astype(np.int64)
+            cx = g["center_x_w"].to_numpy().astype(np.float64)
+            cy = g["center_y_w"].to_numpy().astype(np.float64)
+            cz = g["center_z_w"].to_numpy().astype(np.float64)
+            qx = g["q_x_w"].to_numpy().astype(np.float64)
+            qy = g["q_y_w"].to_numpy().astype(np.float64)
+            qz = g["q_z_w"].to_numpy().astype(np.float64)
+            qw = g["q_w_w"].to_numpy().astype(np.float64)
+            sx = g["size_x"].to_numpy().astype(np.float32).max()  # length (rigid track)
+            sy = g["size_y"].to_numpy().astype(np.float32).max()  # width
+            sz = g["size_z"].to_numpy().astype(np.float32).max()  # height
+            n = len(ti)
+
+            poses = np.tile(np.eye(4)[None, :, :], (n, 1, 1)).astype(np.float64)
+            for i in range(n):
+                R = _quat_to_R(qx[i], qy[i], qz[i], qw[i])
+                # Apply world rotation: p_iso = Rwrot @ p_ncore
+                R_world = Rwrot @ R
+                t_world = Rwrot @ np.array([cx[i], cy[i], cz[i]]) + twrot
+                poses[i, :3, :3] = R_world
+                poses[i, :3, 3] = t_world
+
+            timestamps_s = ts_seconds[ti]
+            # dims: PandaSet convention is (width, length, height). NCore stores (size_x=length,
+            # size_y=width, size_z=height). Reorder to (width, length, height).
+            dims = np.array([sy, sx, sz], dtype=np.float32)
+
+            label = str(g["label_class"].iloc[0])
+            is_pedestrian = label in NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES
+
+            trajectories.append({
+                "poses": torch.from_numpy(poses).float(),
+                "timestamps": torch.from_numpy(timestamps_s),
+                "dims": torch.from_numpy(dims),
+                "label": label,
+                "stationary": False,
+                "symmetric": not is_pedestrian,
+                "deformable": is_pedestrian,
+            })
+        return trajectories
+
+    # ----- Split override --------------------------------------------------------
+
+    def _get_train_eval_indices(self, sensors) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._train_timesteps is None or self.config.splits_json == "auto":
+            return super()._get_train_eval_indices(sensors)
+        # Map sensor-array indices to their timestep via metadata.
+        timesteps = sensors.metadata["timesteps"].squeeze(-1).cpu().numpy()
+        train_mask = np.isin(timesteps, self._train_timesteps)
+        eval_mask = np.isin(timesteps, self._eval_timesteps)
+        train_idx = torch.from_numpy(np.where(train_mask)[0]).long()
+        eval_idx = torch.from_numpy(np.where(eval_mask)[0]).long()
+        if self.config.max_eval_frames is not None:
+            torch.manual_seed(123)
+            eval_idx = eval_idx[torch.randperm(len(eval_idx))[: self.config.max_eval_frames]]
+        return train_idx, eval_idx
+
+    def _load_split_indices(self):
+        if self.config.splits_json == "auto":
+            return None, None
+        path = self.clip_root / "splits" / f"{self.config.splits_json}.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Split file not found: {path}")
+        data = json.loads(path.read_text())
+        return np.array(data["train_indices"], dtype=np.int64), np.array(data["eval_indices"], dtype=np.int64)
+
+
+# ---- Helpers --------------------------------------------------------------------
+
+
+def _list_to_4x4(rows: List[List[float]]) -> np.ndarray:
+    arr = np.array(rows, dtype=np.float64)
+    if arr.shape == (4, 4):
+        return arr
+    if arr.shape == (3, 4):
+        out = np.eye(4)
+        out[:3, :4] = arr
+        return out
+    raise ValueError(f"Expected 3x4 or 4x4 matrix, got {arr.shape}")
+
+
+def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Quaternion (x, y, z, w) -> 3x3 rotation matrix."""
+    n = qx * qx + qy * qy + qz * qz + qw * qw
+    if n < 1e-12:
+        return np.eye(3)
+    s = 2.0 / n
+    R = np.array([
+        [1 - s * (qy * qy + qz * qz), s * (qx * qy - qz * qw),     s * (qx * qz + qy * qw)],
+        [s * (qx * qy + qz * qw),     1 - s * (qx * qx + qz * qz), s * (qy * qz - qx * qw)],
+        [s * (qx * qz - qy * qw),     s * (qy * qz + qx * qw),     1 - s * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+    return R
+
+
+def _resolve_clip_root(data_root: Path, sequence: str) -> Path:
+    """Find <data_root>/processed/<clip_prefix><sequence>...<rest>/processed_pinhole.
+
+    Matches either by leading 3-digit prefix (``002``) or by uuid prefix (``b9ea7a9d``).
+    """
+    processed = data_root / "processed"
+    if not processed.exists():
+        raise FileNotFoundError(f"No 'processed/' dir under {data_root}")
+    candidates = []
+    for child in sorted(processed.iterdir()):
+        if not child.is_dir():
+            continue
+        name = child.name
+        if name.startswith(f"{sequence}_") or sequence in name:
+            candidates.append(child)
+    if not candidates:
+        raise ValueError(
+            f"Sequence '{sequence}' not found under {processed}. "
+            f"Available: {[c.name for c in sorted(processed.iterdir()) if c.is_dir()]}"
+        )
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Sequence '{sequence}' matches multiple clips: {[c.name for c in candidates]}. "
+            f"Use a longer/more specific prefix."
+        )
+    clip = candidates[0] / "processed_pinhole"
+    if not clip.exists():
+        raise FileNotFoundError(f"No processed_pinhole/ under {candidates[0]}")
+    return clip
