@@ -1,0 +1,75 @@
+{
+  "num_images": 693,
+  "psnr": 25.051801153075644,
+  "ssim": 0.884583341008829,
+  "lpips": 0.34333503235556173,
+  "psnr_masked": 25.465990559191244,
+  "ssim_masked": 0.9014171115075699,
+  "lpips_masked": 0.32711254548372815,
+  "per_camera": {
+    "camera_cross_left_120fov": {
+      "psnr": 30.845638294412634,
+      "ssim": 0.9540356012305828,
+      "lpips": 0.1769754480231892,
+      "psnr_masked": 29.83037829158282,
+      "ssim_masked": 0.9553708668911096,
+      "lpips_masked": 0.1764800131621987,
+      "n": 99
+    },
+    "camera_cross_right_120fov": {
+      "psnr": 26.678977060799646,
+      "ssim": 0.9317349815609479,
+      "lpips": 0.25907914566271234,
+      "psnr_masked": 25.63958601518111,
+      "ssim_masked": 0.9336791670683658,
+      "lpips_masked": 0.2584033305897857,
+      "n": 99
+    },
+    "camera_front_tele_30fov": {
+      "psnr": 23.303332242098723,
+      "ssim": 0.8375718087861033,
+      "lpips": 0.4281263833094125,
+      "psnr_masked": 28.89764280993529,
+      "ssim_masked": 0.9057560575128806,
+      "lpips_masked": 0.3743206431167294,
+      "n": 99
+    },
+    "camera_front_wide_120fov": {
+      "psnr": 27.91016308948247,
+      "ssim": 0.9247826139132181,
+      "lpips": 0.2750156032617646,
+      "psnr_masked": 26.766640191126353,
+      "ssim_masked": 0.9258165847171437,
+      "lpips_masked": 0.27436832827751084,
+      "n": 99
+    },
+    "camera_rear_left_70fov": {
+      "psnr": 22.107321806628295,
+      "ssim": 0.8851075816636134,
+      "lpips": 0.3623527730956222,
+      "psnr_masked": 21.0546062546547,
+      "ssim_masked": 0.8881691832735081,
+      "lpips_masked": 0.3605477517903453,
+      "n": 99
+    },
+    "camera_rear_right_70fov": {
+      "psnr": 22.492588081745186,
+      "ssim": 0.8791913341994237,
+      "lpips": 0.39646809962060714,
+      "psnr_masked": 22.61872297344786,
+      "ssim_masked": 0.8913307936504634,
+      "lpips_masked": 0.37833267179402436,
+      "n": 99
+    },
+    "camera_rear_tele_30fov": {
+      "psnr": 22.02458749636255,
+      "ssim": 0.7796594657079138,
+      "lpips": 0.5053277735156242,
+      "psnr_masked": 23.45435737841057,
+      "ssim_masked": 0.8097971274395181,
+      "lpips_masked": 0.4673350796555028,
+      "n": 99
+    }
+  },
+  "source": "rendered val PNGs (rgb vs gt-rgb); *_masked uses masks/<cam>/valid_mask.png"
+}

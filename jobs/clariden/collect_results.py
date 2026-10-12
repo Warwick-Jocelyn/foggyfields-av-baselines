@@ -32,7 +32,8 @@ for clip in ("NFF-03", "NFF-02"):
         tt = tim.get((f"splatad_{variant}", clip, "train")); rt = tim.get((f"splatad_{variant}", clip, "sec"))
         L.append(f"| {clip} | {variant} | {f(r['psnr'])} | {f(r['ssim'],3)} | {f(r['lpips'],3)} | {f(r['psnr_masked'])} | {f(r['ssim_masked'],3)} | {f(r['lpips_masked'],3)} | "
                  f"{'—' if not tt else int(tt)//60} | {'—' if not rt else int(rt)//60} |")
-L += ["", "## LiDAR depth (rendered z-depth vs GT returns, held-out frames, metres)", "",
+L += ["", "## LiDAR depth (camera-rendered expected depth vs GT returns, held-out frames, metres)", "",
+      "Caveat: SplatAD's camera depth is gsplat's alpha-weighted *expected* depth (`RGB+ED`). In fog, semi-transparent Gaussians near the camera dominate it, so it saturates at roughly 10 to 17 m frame-wide even where PSNR is fine (verified on faithful/NFF-02: pred/GT ratio 0.6 median, GT 20 to 40 m rendered at about 9.6 m). The numbers below therefore measure that saturation, not projection quality, and are similar under both conventions. The method's native LiDAR rasterization (ns-eval `median_depth`, used for the June CD/RCD study) is the meaningful geometry metric.", "",
       "| Clip | Run | convention | median L1 | mean L1 | acc@5m | points |", "|---|---|---|---|---|---|---|"]
 for clip in ("NFF-03", "NFF-02"):
     L.append(f"| {clip} | **published** | legacy (orig script, wrong) | {PUB[clip]['lidar_med']:.2f} | — | — | — |")
