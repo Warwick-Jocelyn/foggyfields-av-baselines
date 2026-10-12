@@ -11,6 +11,8 @@ for variant in ("faithful", "corrected", "hf_ckpt"):
         d = OUT / variant / clip; r = {}
         if (d / "rgb_metrics.json").exists(): r["rgb"] = json.loads((d / "rgb_metrics.json").read_text())
         if (d / "lidar_metrics.json").exists(): r["lidar"] = json.loads((d / "lidar_metrics.json").read_text())
+        if (d / "lidar_chamfer.json").exists():
+            cj = json.loads((d / "lidar_chamfer.json").read_text()); cj.pop("per_frame", None); r["chamfer"] = cj
         r["done"] = (d / "LANE_DONE").exists(); res[f"{variant}/{clip}"] = r
 tim = {}
 tp = OUT / "_timings/timings.csv"
@@ -22,16 +24,27 @@ L = ["# SplatAD on NFF — reproduction results (Clariden GH200, %s)" % __import
      "Protocol: nvs_50_50 (odd frames held out), 30k iters, seed 42, MCMC cap 5M, 2M seed points, camera-opt off — identical to the published config.",
      "`faithful` = original code; `corrected` = valid-pixel mask in RGB loss + LiDAR sweeps read in their true sensor frame (the original code offsets them by the 1.94 m mount height); `hf_ckpt` = the published Hugging Face checkpoint evaluated on the NFF copy of the clip.",
      "Metrics: torchmetrics PSNR/SSIM, LPIPS-AlexNet over all 7 cameras × 99 held-out frames. `masked` columns exclude the black rectification corners.", "",
-     "## RGB (held-out)", "", "| Clip | Run | PSNR | SSIM | LPIPS | PSNR masked | SSIM masked | LPIPS masked | train min | render min |", "|---|---|---|---|---|---|---|---|---|---|"]
+     "## RGB (held-out)", "", "| Clip | Run | PSNR | SSIM | LPIPS | PSNR masked | SSIM masked | LPIPS masked | train (min, 30k it) | infer ms/frame | infer ms/sweep | render+metrics (min) |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
 for clip in ("NFF-03", "NFF-02"):
-    p = PUB[clip]; L.append(f"| {clip} | **published** ({p['name']}, Blackwell) | {p['psnr']:.2f} | {p['ssim']:.3f} | {p['lpips']:.3f} | — | — | — | — | — |")
-    if clip in JUNE: L.append(f"| {clip} | June-2026 Clariden run (orig cfg) | {JUNE[clip]['psnr']:.2f} | — | {JUNE[clip]['lpips']:.2f} | — | — | — | — | — |")
+    p = PUB[clip]; L.append(f"| {clip} | **published** ({p['name']}, Blackwell) | {p['psnr']:.2f} | {p['ssim']:.3f} | {p['lpips']:.3f} | — | — | — | — | — | — | — |")
+    if clip in JUNE: L.append(f"| {clip} | June-2026 Clariden run (orig cfg) | {JUNE[clip]['psnr']:.2f} | — | {JUNE[clip]['lpips']:.2f} | — | — | — | — | — | — | — |")
     for variant in ("hf_ckpt", "faithful", "corrected"):
         r = res[f"{variant}/{clip}"].get("rgb")
-        if not r: L.append(f"| {clip} | {variant} | (missing) | | | | | | | |"); continue
-        tt = tim.get((f"splatad_{variant}", clip, "train")); rt = tim.get((f"splatad_{variant}", clip, "sec"))
+        if not r: L.append(f"| {clip} | {variant} | (missing) | | | | | | | | | |"); continue
+        tt = tim.get((f"splatad_{variant}", clip, "train")); rt = tim.get((f"splatad_{variant}", clip, "sec")); ch = res[f"{variant}/{clip}"].get("chamfer") or {}
         L.append(f"| {clip} | {variant} | {f(r['psnr'])} | {f(r['ssim'],3)} | {f(r['lpips'],3)} | {f(r['psnr_masked'])} | {f(r['ssim_masked'],3)} | {f(r['lpips_masked'],3)} | "
-                 f"{'—' if not tt else int(tt)//60} | {'—' if not rt else int(rt)//60} |")
+                 f"{'— (published ckpt)' if variant == 'hf_ckpt' else ('—' if not tt else round(int(tt)/60, 1))} | {f(ch.get('infer_ms_per_camera_frame'), 1)} | {f(ch.get('infer_ms_per_lidar_sweep'), 1)} | {'—' if not rt else round(int(rt)/60, 1)} |")
+L += ["", "## LiDAR geometry — native LiDAR rasterization, held-out sweeps (99 per clip)", "",
+      "CD = symmetric mean nearest-neighbour distance between the rendered point cloud (ray-drop applied) and the GT sweep, in metres (the June-2026 definition; lower is better). "
+      "CD² = nerfstudio/SplatAD's own `chamfer_distance` (sum of squared NN distances both ways / |GT|, m²). RCD = CD / mean GT range. "
+      "Depth median L2 = median |pred − GT| range on returned rays. Ray-drop acc = ray-drop classification accuracy. "
+      "June-2026 reference (NFF-02, original config): SplatAD CD 1.199 m / RCD 0.0487; NeuRAD 0.355 / 0.0144.", "",
+      "| Clip | Run | CD (m) | CD² (m²) | RCD | depth median L2 (m) | ray-drop acc | pred pts | GT pts |", "|---|---|---|---|---|---|---|---|---|"]
+for clip in ("NFF-03", "NFF-02"):
+    for variant in ("hf_ckpt", "faithful", "corrected"):
+        ch = res[f"{variant}/{clip}"].get("chamfer")
+        if not ch: L.append(f"| {clip} | {variant} | (missing) | | | | | | |"); continue
+        L.append(f"| {clip} | {variant} | {f(ch['cd_m'],3)} | {f(ch['cd2_m2'],3)} | {f(ch['rcd'],4)} | {f(ch['depth_median_l2_m'],3)} | {f(ch['ray_drop_acc'],3)} | {ch['n_pred']} | {ch['n_gt']} |")
 L += ["", "## LiDAR depth (camera-rendered expected depth vs GT returns, held-out frames, metres)", "",
       "Caveat: SplatAD's camera depth is gsplat's alpha-weighted *expected* depth (`RGB+ED`). In fog, semi-transparent Gaussians near the camera dominate it, so it saturates at roughly 10 to 17 m frame-wide even where PSNR is fine (verified on faithful/NFF-02: pred/GT ratio 0.6 median, GT 20 to 40 m rendered at about 9.6 m). The numbers below therefore measure that saturation, not projection quality, and are similar under both conventions. The method's native LiDAR rasterization (ns-eval `median_depth`, used for the June CD/RCD study) is the meaningful geometry metric.", "",
       "| Clip | Run | convention | median L1 | mean L1 | acc@5m | points |", "|---|---|---|---|---|---|---|"]

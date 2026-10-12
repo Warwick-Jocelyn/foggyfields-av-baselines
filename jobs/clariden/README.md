@@ -25,6 +25,7 @@ Clip-ID map (the HF checkpoint names use the OLD ids): old 002 = NFF-01, **old 0
 | `prep_hf_config.py` | rewrite a published `config.yml` (paths, no wandb) so `ns-render/ns-eval` can load the HF checkpoint here |
 | `rgb_metrics.py` | PSNR/SSIM/LPIPS, unmasked (= original script) and masked by `masks/<cam>/valid_mask.png` |
 | `lidar_metrics.py` | LiDAR depth error with the validated conventions (`correct`) and the original script's math (`legacy`, wrong) side by side |
+| `lidar_chamfer_eval.py` / `chamfer_all.sbatch` | native-LiDAR Chamfer (CD m, CD² m², RCD), depth L2, and per-frame / per-sweep inference timing for all 6 models (debug node, ~11 min) |
 | `collect_results.py` | `RESULTS.md` with published / June-2026 / new numbers side by side |
 
 ## Dataparser changes (both default to the ORIGINAL behaviour; the `corrected` variant turns them on)
