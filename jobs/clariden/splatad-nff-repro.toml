@@ -1,0 +1,27 @@
+# SplatAD reproduction on NFF (foggyfields-av-baselines) — CSCS Container Engine EDF.
+# Base NGC PyTorch 24.08 (torch 2.5.0nv, CUDA 12.6, py3.10, aarch64, native sm_90).
+# /users mounted so ~/.netrc (wandb) and ~/projects (code repo) are visible.
+image = "/capstor/store/cscs/swissai/a0195/yitiwang/containers/ngc-pytorch-base+24.08.sqsh"
+
+mounts = [
+    "/capstor",
+    "/iopsstor",
+    "/users",
+]
+
+workdir = "/capstor/scratch/cscs/yitiwang/splatad-nff-repro"
+
+[env]
+# Everything cache-like lives on capstor scratch (30-day purge), never in HOME/store.
+XDG_CACHE_HOME = "/capstor/scratch/cscs/yitiwang/splatad-nff-repro/cache"
+TORCH_HOME = "/capstor/scratch/cscs/yitiwang/splatad-nff-repro/cache/torch"
+TORCH_EXTENSIONS_DIR = "/capstor/scratch/cscs/yitiwang/splatad-nff-repro/cache/torch_extensions"
+PIP_CACHE_DIR = "/capstor/scratch/cscs/yitiwang/splatad-nff-repro/cache/pip"
+HF_HOME = "/capstor/scratch/cscs/yitiwang/splatad-nff-repro/cache/huggingface"
+PYTHONNOUSERSITE = "1"
+PYTHONUNBUFFERED = "1"
+MPICH_GPU_SUPPORT_ENABLED = "0"
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"

@@ -1,0 +1,41 @@
+{
+  "correct": {
+    "num_points": 23215626,
+    "num_points_in_image": 23215934,
+    "depth_l1_mean": 12.52574302658811,
+    "depth_l1_median": 7.840110355523841,
+    "depth_rmse": 18.70617821492858,
+    "acc@1m": 0.1101783341961143,
+    "acc@2m": 0.19398550786440133,
+    "acc@5m": 0.3845333311279222,
+    "per_camera_median": {
+      "camera_front_wide_120fov": 8.05761234990372,
+      "camera_cross_left_120fov": 9.53501785666565,
+      "camera_cross_right_120fov": 7.388778801290368,
+      "camera_rear_left_70fov": 9.587583560475817,
+      "camera_rear_right_70fov": 4.924841323554055,
+      "camera_front_tele_30fov": 13.85243694567152,
+      "camera_rear_tele_30fov": 18.884572572616456
+    }
+  },
+  "legacy_original_script(WRONG)": {
+    "num_points": 29107958,
+    "num_points_in_image": 29109026,
+    "depth_l1_mean": 13.543143126614826,
+    "depth_l1_median": 8.633501890810809,
+    "depth_rmse": 20.314901470600617,
+    "acc@1m": 0.06742104684911253,
+    "acc@2m": 0.1377705711956847,
+    "acc@5m": 0.3314903092824306,
+    "per_camera_median": {
+      "camera_front_wide_120fov": 6.988653685325501,
+      "camera_cross_left_120fov": 7.187045241742219,
+      "camera_cross_right_120fov": 7.096658773366379,
+      "camera_rear_left_70fov": 11.324165136811494,
+      "camera_rear_right_70fov": 8.758356690520454,
+      "camera_front_tele_30fov": 25.379937194478114,
+      "camera_rear_tele_30fov": 26.710717123016966
+    }
+  },
+  "note": "Use 'correct'. 'legacy' reproduces the published script's math (sweep as ego, T_camera_rig direct) and is geometrically wrong; kept only to re-interpret old numbers."
+}

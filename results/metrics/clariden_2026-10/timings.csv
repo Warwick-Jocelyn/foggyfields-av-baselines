@@ -1,0 +1,10 @@
+splatad_faithful,NFF-02,30000,train_sec,1643,rc=0
+splatad_corrected,NFF-02,30000,train_sec,2133,rc=0
+splatad_faithful,NFF-02,render,sec,530,
+splatad_faithful,NFF-03,30000,train_sec,2565,rc=0
+splatad_corrected,NFF-02,render,sec,522,
+splatad_corrected,NFF-03,30000,train_sec,2712,rc=0
+splatad_faithful,NFF-03,render,sec,619,
+splatad_corrected,NFF-03,render,sec,575,
+splatad_hf_ckpt,NFF-02,render,sec,593,
+splatad_hf_ckpt,NFF-03,render,sec,613,

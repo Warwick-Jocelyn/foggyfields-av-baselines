@@ -168,6 +168,18 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
 
     include_deformable_actors: bool = False
 
+    lidar_points_frame: Literal["ego", "sensor"] = "ego"
+    """Frame of the xyz columns in ``lidar/sweep_*.npy``. The original code assumed "ego" and mapped the
+    points into the lidar-sensor frame with inv(T_lidar_rig). On the packaged NFF release the sweeps are
+    already in the SENSOR frame (ground plane sits at z≈-1.94 m = minus the lidar mount height; verified
+    2026-10-12), so "sensor" (= use the points as-is) is the geometrically correct setting. Default stays
+    "ego" to reproduce the published runs exactly."""
+
+    use_valid_masks: bool = False
+    """If True, attach ``masks/<cam>/valid_mask.png`` (the ftheta->pinhole valid region) as the
+    per-image mask so the black rectification corners are excluded from the RGB loss and from
+    the model's own eval metrics. Off by default to stay faithful to the published runs."""
+
 
 @dataclass
 class NvidiaAvFog(ADDataParser):
@@ -228,7 +240,16 @@ class NvidiaAvFog(ADDataParser):
         self.num_timesteps = T
         # If a fixed split file was requested, load timestep indices for it.
         self._train_timesteps, self._eval_timesteps = self._load_split_indices()
-        return super()._generate_dataparser_outputs(split)
+        outputs = super()._generate_dataparser_outputs(split)
+        if self.config.use_valid_masks:
+            # image path is <clip_root>/images/<cam>/frame_XXXX.jpg -> mask is per-camera, time-invariant
+            outputs.mask_filenames = [
+                self.clip_root / "masks" / Path(f).parent.name / "valid_mask.png" for f in outputs.image_filenames
+            ]
+            missing = [m for m in set(outputs.mask_filenames) if not m.exists()]
+            if missing:
+                raise FileNotFoundError(f"use_valid_masks=True but masks are missing: {missing}")
+        return outputs
 
     # ----- ADDataParser overrides -------------------------------------------------
 
@@ -344,9 +365,12 @@ class NvidiaAvFog(ADDataParser):
         """
         # self.T_lidar_rig is T_rig_from_lidar (lidar->rig); invert to get rig->lidar so we can
         # transform sweep points from ego(=rig) frame into actual lidar-sensor frame.
-        T_lid_from_rig = torch.tensor(np.linalg.inv(self.T_lidar_rig), dtype=torch.float64)
-        Rrig = T_lid_from_rig[:3, :3].float()
-        trig = T_lid_from_rig[:3, 3].float()
+        if self.config.lidar_points_frame == "sensor":
+            Rrig = torch.eye(3); trig = torch.zeros(3)  # points already in the lidar-sensor frame
+        else:
+            T_lid_from_rig = torch.tensor(np.linalg.inv(self.T_lidar_rig), dtype=torch.float64)
+            Rrig = T_lid_from_rig[:3, :3].float()
+            trig = T_lid_from_rig[:3, 3].float()
         point_clouds = []
         for f in filenames:
             sweep = np.load(f)  # [N, 6] float32
