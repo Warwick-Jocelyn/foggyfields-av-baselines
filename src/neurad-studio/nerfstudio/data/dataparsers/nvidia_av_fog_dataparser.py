@@ -88,24 +88,72 @@ LIDAR_SWEEP_COL_INTENSITY = 3
 LIDAR_SWEEP_COL_T_OFFSET_US = 4
 LIDAR_SWEEP_COL_RING_ID = 5
 
-# Allowed NCore obstacle classes. NCore auto-labels v2 surface these for the fog clips:
-#   automobile, trailer, heavy_truck, bus, motorcycle, bicycle, ... (pedestrian/two-wheeler rare)
-NVIDIA_AV_FOG_ALLOWED_RIGID_CLASSES: Tuple[str, ...] = (
+# ---------------------------------------------------------------------------------
+# F4. The real NCore obstacle vocabulary.
+#
+# Counted over every box of all 15 fog clips and all 17 clear clips:
+#
+#   class               fog      clear
+#   automobile        22710     103684
+#   person               93      53585
+#   heavy_truck        3763       1844
+#   rider                50       1827
+#   trailer            1256       1416
+#   bus                 217       1055
+#   train_or_tram_car     0        755
+#   stroller              0        724
+#   animal              856         31
+#   protruding_object    64        325
+#   other_vehicle       521        206
+#
+# What the previous lists got wrong:
+#   * the rigid whitelist contained motorcycle / bicycle / train / trolley / tram,
+#     none of which NCore ever emits -- five dead entries;
+#   * the deformable list was pedestrian / person / two_wheeler: `pedestrian` and
+#     `two_wheeler` do not exist, and `rider` -- which IS NCore's cyclist /
+#     motorcyclist class -- was missing entirely;
+#   * `animal` (856 fog boxes, 4x more than bus) and `protruding_object` were in
+#     neither list and were dropped without a word;
+#   * `train_or_tram_car` (755 clear boxes) and `stroller` (724) appear in neither.
+#
+# Assignments below are deliberate; `class_taxonomy.json` in each clip carries NCore's
+# own nuScenes/COCO mapping and agrees with the vehicle/person split.
+# ---------------------------------------------------------------------------------
+
+# Rigid, left-right symmetric: a box can be mirrored about its long axis.
+NVIDIA_AV_FOG_RIGID_CLASSES: Tuple[str, ...] = (
     "automobile",
-    "trailer",
     "heavy_truck",
     "bus",
+    "trailer",
     "other_vehicle",
-    "motorcycle",
-    "bicycle",
-    "train",
-    "trolley",
-    "tram",
+    "train_or_tram_car",
 )
-NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES: Tuple[str, ...] = (
-    "pedestrian",
+
+# Rigid but NOT symmetric -- the shape has a clear front/back and is small enough that
+# mirroring is visible.
+NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES: Tuple[str, ...] = ("stroller",)
+
+# Deformable: the actor's shape changes over the track, so the rigid-box actor model
+# does not hold. `rider` is a judgement call -- the box contains a person on a
+# two-wheeler, which articulates and leans; we treat it as deformable rather than as a
+# rigid vehicle. `animal` likewise.
+NVIDIA_AV_FOG_DEFORMABLE_CLASSES: Tuple[str, ...] = (
     "person",
-    "two_wheeler",
+    "rider",
+    "animal",
+)
+
+# Not an actor: infrastructure / cargo sticking into the road. These belong to the
+# static field, not to the dynamic-actor branch. Enable with
+# `--include-static-object-actors True` if you want them as (stationary) actors.
+NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES: Tuple[str, ...] = ("protruding_object",)
+
+NVIDIA_AV_FOG_KNOWN_CLASSES: Tuple[str, ...] = (
+    NVIDIA_AV_FOG_RIGID_CLASSES
+    + NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES
+    + NVIDIA_AV_FOG_DEFORMABLE_CLASSES
+    + NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES
 )
 
 # Sensor specs for the NCore 128-line top LiDAR. Beam divergences are not published
@@ -207,7 +255,23 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     defer to the parent class' LINSPACE split (which matches ``nvs_50_50`` for
     ``train_split_fraction=0.5``)."""
 
-    include_deformable_actors: bool = False
+    include_deformable_actors: bool = True
+    """Load person / rider / animal tracks. Upstream's default is False; we flip it here
+    because on this dataset it is not a corner case -- `person` is 53,585 of the clear
+    set's boxes (NCF-08 alone has 19,396) and `rider` another 1,827. With False they are
+    all silently absent from the dynamic-actor branch. Set False to reproduce the
+    superseded runs."""
+
+    include_static_object_actors: bool = False
+    """Load `protruding_object` (64 fog / 325 clear boxes) as actors. Off by default:
+    these are infrastructure/cargo and belong to the static field."""
+
+    unknown_class_policy: Literal["error", "warn", "drop"] = "error"
+    """What to do with a `label_class` that is in none of the lists above. `error`
+    (default) fails at parse time, seconds into a run, naming the class and its count --
+    the previous behaviour was to drop it silently, which is how `animal` and
+    `protruding_object` went missing. `warn` keeps going; `drop` restores the old
+    silence."""
 
     # ---- F3: LiDAR point frame ----------------------------------------------------
     lidar_points_frame: Literal["auto", "ego", "sensor"] = "auto"
@@ -752,10 +816,8 @@ class NvidiaAvFog(ADDataParser):
         Rwrot = self._world_rotation[:3, :3]
         twrot = self._world_rotation[:3, 3]
 
-        allowed = set(NVIDIA_AV_FOG_ALLOWED_RIGID_CLASSES)
-        if self.config.include_deformable_actors:
-            allowed |= set(NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES)
-        df = df[df["label_class"].str.lower().isin(allowed)]
+        df = df.assign(label_class=df["label_class"].str.lower())
+        df = self._filter_actor_classes(df)
         if not len(df):
             return []
 
@@ -791,7 +853,8 @@ class NvidiaAvFog(ADDataParser):
             dims = np.array([sy, sx, sz], dtype=np.float32)
 
             label = str(g["label_class"].iloc[0])
-            is_pedestrian = label in NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES
+            deformable = label in NVIDIA_AV_FOG_DEFORMABLE_CLASSES
+            symmetric = label in NVIDIA_AV_FOG_RIGID_CLASSES
 
             trajectories.append({
                 "poses": torch.from_numpy(poses).float(),
@@ -799,10 +862,62 @@ class NvidiaAvFog(ADDataParser):
                 "dims": torch.from_numpy(dims),
                 "label": label,
                 "stationary": False,
-                "symmetric": not is_pedestrian,
-                "deformable": is_pedestrian,
+                "symmetric": symmetric,
+                "deformable": deformable,
             })
         return trajectories
+
+    def _filter_actor_classes(self, df: pd.DataFrame) -> pd.DataFrame:
+        """F4. Keep the actor classes we model, and account for every box we do not.
+
+        Prints a per-class table (count, category, kept/dropped) so a class can never go
+        missing without it showing up in the log.
+        """
+        counts = df["label_class"].value_counts().to_dict()
+        unknown = {c: n for c, n in counts.items() if c not in NVIDIA_AV_FOG_KNOWN_CLASSES}
+        if unknown:
+            msg = (
+                f"Unknown obstacle class(es) in {self.clip_root.name}: "
+                + ", ".join(f"{c} ({n} boxes)" for c, n in sorted(unknown.items(), key=lambda kv: -kv[1]))
+                + ". Add them to NVIDIA_AV_FOG_RIGID_CLASSES / _DEFORMABLE_CLASSES / "
+                "_STATIC_OBJECT_CLASSES, or pass `--unknown-class-policy warn|drop`."
+            )
+            if self.config.unknown_class_policy == "error":
+                raise ValueError(msg)
+            if self.config.unknown_class_policy == "warn":
+                CONSOLE.print(f"[bold red]NVIDIA_AV_FOG: {msg}[/bold red]")
+
+        allowed = set(NVIDIA_AV_FOG_RIGID_CLASSES) | set(NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES)
+        if self.config.include_deformable_actors:
+            allowed |= set(NVIDIA_AV_FOG_DEFORMABLE_CLASSES)
+        if self.config.include_static_object_actors:
+            allowed |= set(NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES)
+
+        def category(c: str) -> str:
+            if c in NVIDIA_AV_FOG_RIGID_CLASSES:
+                return "rigid"
+            if c in NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES:
+                return "rigid (asym)"
+            if c in NVIDIA_AV_FOG_DEFORMABLE_CLASSES:
+                return "deformable"
+            if c in NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES:
+                return "static object"
+            return "UNKNOWN"
+
+        kept = dropped = 0
+        CONSOLE.log(f"NVIDIA_AV_FOG actor classes in {self.clip_root.name}:")
+        for c, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            keep = c in allowed
+            kept += n if keep else 0
+            dropped += 0 if keep else n
+            CONSOLE.log(f"  {c:20s} {n:7d} boxes  {category(c):14s} {'KEPT' if keep else 'dropped'}")
+        total = kept + dropped
+        CONSOLE.log(
+            f"  -> {kept}/{total} boxes kept ({100.0 * kept / max(total, 1):.1f}%), "
+            f"include_deformable_actors={self.config.include_deformable_actors}, "
+            f"include_static_object_actors={self.config.include_static_object_actors}"
+        )
+        return df[df["label_class"].isin(allowed)]
 
     # ----- Split override --------------------------------------------------------
 
