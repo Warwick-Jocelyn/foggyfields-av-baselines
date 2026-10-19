@@ -156,9 +156,18 @@ NVIDIA_AV_FOG_KNOWN_CLASSES: Tuple[str, ...] = (
     + NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES
 )
 
-# Sensor specs for the NCore 128-line top LiDAR. Beam divergences are not published
-# by NVIDIA; we reuse the Pandar64 values as conservative defaults. They only matter
-# for `add_missing_points` (which is off by default) and for ray-drop modeling.
+# F6. The top LiDAR is a 128-beam row-offset spinning unit; `calib/lidar_intrinsics.json`
+# publishes its real geometry per clip (per-vehicle calibration):
+#   n_rows 128, n_columns 3600, spinning_frequency_hz 10.0, spinning_direction "cw",
+#   row_elevations_rad[128], column_azimuths_rad[3600], row_azimuth_offsets_rad[128]
+# The parser used LidarType.PANDAR64 -- a 64-beam sensor -- whose 64 static elevations
+# then drove the range-image rasterisation and therefore the ray-drop model, one of
+# NeuRAD's selling points. We now declare LidarType.NCORE128 and hand the measured
+# elevations/azimuths to `Lidars`, which both SplatAD and the lidar datamanager prefer
+# over the enum's static table.
+#
+# Beam divergence genuinely is NOT published by NVIDIA. The Pandar64 values below stay
+# as the default, but they are now config fields so an ablation is one flag.
 HORIZONTAL_BEAM_DIVERGENCE = 3e-3
 VERTICAL_BEAM_DIVERGENCE = 1.5e-3
 
@@ -266,6 +275,23 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     """Load `protruding_object` (64 fog / 325 clear boxes) as actors. Off by default:
     these are infrastructure/cargo and belong to the static field."""
 
+    # ---- F6: LiDAR model -----------------------------------------------------------
+    use_published_beam_geometry: bool = True
+    """Read `calib/lidar_intrinsics.json` and hand the real 128 beam elevations and 3600
+    column azimuths to `Lidars`. False falls back to the LidarType's static table, i.e.
+    the superseded 64-beam Pandar64 grid."""
+
+    horizontal_beam_divergence: float = HORIZONTAL_BEAM_DIVERGENCE
+    vertical_beam_divergence: float = VERTICAL_BEAM_DIVERGENCE
+    """Beam divergence, radians. NVIDIA does not publish these for the NCore lidar; the
+    defaults are Pandar64's and are a stated assumption, not a measurement."""
+
+    use_range_image_raydrop: bool = True
+    """Use `lidar/range_image/*.npy` (128 x 3600 with explicit non-returns) to add the
+    rays that did not return, instead of inferring them from the elevation/azimuth grid
+    (`add_missing_points`). Silently inactive when the directory is absent -- it is being
+    generated now and does not exist in every clip yet."""
+
     stationary_speed_threshold: float = 0.5
     """F5. A track whose PEAK speed stays below this (m/s) is marked ``stationary``.
     `obstacles_3d_world.parquet` carries `velocity_x_mps` / `velocity_y_mps`; if they are
@@ -343,6 +369,10 @@ class NvidiaAvFog(ADDataParser):
     timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds (LiDAR spin centre)
     camera_timestamps_us: Dict[str, np.ndarray] = field(default_factory=dict)    # cam -> [T] microseconds
     lidar_frame: str = "sensor"  # resolved from provenance.lidar_frame; see _resolve_lidar_frame()
+    lidar_n_rows: int = 0
+    lidar_n_cols: int = 0
+    lidar_row_elevations: np.ndarray = field(default_factory=lambda: np.zeros((0,)))
+    lidar_col_azimuths: np.ndarray = field(default_factory=lambda: np.zeros((0,)))
     num_timesteps: int = 0
     # Per-camera/lidar metadata for split lookup:
     _cam_timestep: List[int] = field(default_factory=list)
@@ -759,19 +789,66 @@ class NvidiaAvFog(ADDataParser):
         times_t = torch.tensor(times, dtype=torch.float64)
         idxs_t = torch.tensor(idxs, dtype=torch.int32).unsqueeze(-1)
         self._lidar_timestep = timestep_record
+        elevations, azimuths = self._load_beam_geometry()
         lidars = Lidars(
             lidar_to_worlds=poses_t[:, :3, :4],
-            lidar_type=LidarType.PANDAR64,  # closest enum; affects ray-drop only
+            # F6: a 128-beam sensor, declared as such. The old LidarType.PANDAR64 made the
+            # datamanager rasterise onto Pandar64's 64 static elevations.
+            lidar_type=LidarType.NCORE128 if elevations is not None else LidarType.VELODYNE128,
             times=times_t,
             metadata={
                 "sensor_idxs": idxs_t,
                 "timesteps": torch.tensor(timestep_record, dtype=torch.int32).unsqueeze(-1),
             },
-            horizontal_beam_divergence=HORIZONTAL_BEAM_DIVERGENCE,
-            vertical_beam_divergence=VERTICAL_BEAM_DIVERGENCE,
+            horizontal_beam_divergence=self.config.horizontal_beam_divergence,
+            vertical_beam_divergence=self.config.vertical_beam_divergence,
             valid_lidar_distance_threshold=DUMMY_DISTANCE_VALUE / 2,
+            elevations=elevations,
+            azimuths=azimuths,
         )
         return lidars, filenames
+
+    def _load_beam_geometry(self):
+        """F6. The sensor's real beam table from ``calib/lidar_intrinsics.json``.
+
+        Returns ``(elevations, azimuths)`` as [1, n, 1] tensors in radians, sorted
+        ascending (``ELEV_CHANNELS_PER_TILE`` tiling in SplatAD assumes monotone
+        elevations), or ``(None, None)`` when disabled or unavailable.
+        """
+        if not self.config.use_published_beam_geometry:
+            CONSOLE.print(
+                "[bold yellow]NVIDIA_AV_FOG: use_published_beam_geometry=False -> falling back to a "
+                "static 128-beam elevation table; ray-drop geometry will not match this vehicle."
+                "[/bold yellow]"
+            )
+            return None, None
+        path = self.clip_root / "calib" / "lidar_intrinsics.json"
+        if not path.exists():
+            CONSOLE.print(f"[bold yellow]NVIDIA_AV_FOG: {path} missing; using the static beam table.[/bold yellow]")
+            return None, None
+        spec = json.loads(path.read_text())
+        elev = np.asarray(spec["row_elevations_rad"], dtype=np.float64)
+        azim = np.asarray(spec["column_azimuths_rad"], dtype=np.float64)
+        n_rows, n_cols = int(spec.get("n_rows", len(elev))), int(spec.get("n_columns", len(azim)))
+        if len(elev) != n_rows or len(azim) != n_cols:
+            raise ValueError(
+                f"{path}: n_rows/n_columns ({n_rows}/{n_cols}) disagree with "
+                f"row_elevations_rad/column_azimuths_rad ({len(elev)}/{len(azim)})."
+            )
+        self.lidar_n_rows, self.lidar_n_cols = n_rows, n_cols
+        self.lidar_row_elevations = elev  # unsorted, in sensor row order (= ring_id)
+        self.lidar_col_azimuths = azim
+        elev_sorted = np.sort(elev)
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG lidar: {n_rows} beams x {n_cols} columns, elevation "
+            f"{np.rad2deg(elev_sorted[0]):+.2f}..{np.rad2deg(elev_sorted[-1]):+.2f} deg, "
+            f"azimuth step {np.rad2deg(np.abs(np.median(np.diff(azim)))):.4f} deg, "
+            f"beam divergence h/v {self.config.horizontal_beam_divergence:.1e}/"
+            f"{self.config.vertical_beam_divergence:.1e} rad (ASSUMED, not published)"
+        )
+        elevations = torch.tensor(elev_sorted, dtype=torch.float32).view(1, -1, 1)
+        azimuths = torch.tensor(azim, dtype=torch.float32).view(1, -1, 1)
+        return elevations, azimuths
 
     def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[torch.Tensor]:
         """Returns one [N, 5] tensor per lidar frame: x, y, z, intensity, t_offset (sec).
@@ -791,7 +868,8 @@ class NvidiaAvFog(ADDataParser):
             Rrig = T_lid_from_rig[:3, :3].float()
             trig = T_lid_from_rig[:3, 3].float()
         point_clouds = []
-        for f in filenames:
+        n_dropped_rays = 0
+        for t, f in enumerate(filenames):
             sweep = np.load(f)  # [N, 6] float32
             xyz_ego = torch.from_numpy(sweep[:, 0:3]).float()
             # Ego -> lidar-sensor frame (lidar_to_rig = identity-ish but be safe).
@@ -801,11 +879,87 @@ class NvidiaAvFog(ADDataParser):
                 sweep[:, LIDAR_SWEEP_COL_T_OFFSET_US:LIDAR_SWEEP_COL_T_OFFSET_US + 1].astype(np.float32) * 1e-6
             )
             pc = torch.cat([xyz_sensor, intensity, t_offset_s], dim=-1)  # [N, 5]
+            missing = self._nonreturn_points(t)
+            if missing is not None:
+                n_dropped_rays += missing.shape[0]
+                pc = torch.cat([pc, missing], dim=0)
             point_clouds.append(pc)
         # ADDataParser._adjust_times will rebase pc[:, 4] -= 0 if the column is already
         # an offset (which it is — relative to sweep center). Nothing else to do.
+        if n_dropped_rays:
+            total = sum(pc.shape[0] for pc in point_clouds)
+            CONSOLE.log(
+                f"NVIDIA_AV_FOG ray-drop: added {n_dropped_rays} non-return rays from "
+                f"lidar/range_image/ ({100.0 * n_dropped_rays / max(total, 1):.1f}% of all rays), "
+                f"at the DUMMY_DISTANCE_VALUE={DUMMY_DISTANCE_VALUE} m marker"
+            )
         lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
         return point_clouds
+
+    def _range_image_path(self, t: int) -> "Path | None":
+        d = self.clip_root / "lidar" / "range_image"
+        if not d.is_dir():
+            return None
+        for name in (f"sweep_{t:04d}.npy", f"frame_{t:04d}.npy", f"range_{t:04d}.npy", f"{t:04d}.npy"):
+            p = d / name
+            if p.exists():
+                return p
+        return None
+
+    def _nonreturn_points(self, t: int) -> "torch.Tensor | None":
+        """F6. Rays that did not return, read from the published range image.
+
+        ``lidar/range_image/<t>.npy`` is a [n_rows, n_cols] = [128, 3600] range image in
+        metres in which non-returns are marked explicitly. NeuRAD represents a non-return
+        as a point at ``DUMMY_DISTANCE_VALUE`` (2000 m) along the ray, which is what
+        ``add_missing_points`` synthesises from the beam grid; with a real range image we
+        can emit exactly the rays that actually dropped instead of inferring them.
+
+        ASSUMPTIONS, to re-check when the files land (the directory does not exist in any
+        clip yet -- this path is inactive until it does):
+          * a cell is a non-return iff its value is non-finite or <= 0;
+          * row index == beam index == the sweep's ``ring_id``, so row r has elevation
+            ``row_elevations_rad[r]``; column index c has azimuth ``column_azimuths_rad[c]``;
+          * per-point time is ``(c / n_cols - 0.5) * revolution_time``, i.e. column 0 is
+            read half a revolution before the spin centre. ``row_azimuth_offsets_rad``
+            (max ~0.038 rad = 0.6 us of spin) is NOT applied.
+        The shape is asserted against ``calib/lidar_intrinsics.json``; a mismatch raises.
+        """
+        if not self.config.use_range_image_raydrop:
+            return None
+        path = self._range_image_path(t)
+        if path is None:
+            return None
+        if self.lidar_row_elevations.size == 0:
+            raise ValueError(
+                "use_range_image_raydrop=True needs the beam table from "
+                "calib/lidar_intrinsics.json, but use_published_beam_geometry is off or the file "
+                "is missing."
+            )
+        rng = np.load(path)
+        if rng.ndim == 3:  # [rows, cols, channels] -> range channel
+            rng = rng[..., 0]
+        if rng.shape != (self.lidar_n_rows, self.lidar_n_cols):
+            raise ValueError(
+                f"{path} has shape {rng.shape}, expected "
+                f"({self.lidar_n_rows}, {self.lidar_n_cols}) from calib/lidar_intrinsics.json."
+            )
+        miss = ~np.isfinite(rng) | (rng <= 0)
+        rows, cols = np.nonzero(miss)
+        if rows.size == 0:
+            return None
+        elev = self.lidar_row_elevations[rows]
+        azim = self.lidar_col_azimuths[cols]
+        d = float(DUMMY_DISTANCE_VALUE)
+        xyz = np.stack(
+            [d * np.cos(elev) * np.cos(azim), d * np.cos(elev) * np.sin(azim), d * np.sin(elev)], axis=-1
+        ).astype(np.float32)
+        revolution_time = 1.0 / 10.0  # spinning_frequency_hz = 10.0
+        t_off = ((cols.astype(np.float32) / self.lidar_n_cols) - 0.5) * revolution_time
+        extra = np.concatenate(
+            [xyz, np.zeros((rows.size, 1), np.float32), t_off.astype(np.float32)[:, None]], axis=-1
+        )
+        return torch.from_numpy(extra)
 
     def _get_actor_trajectories(self) -> List[Dict]:
         """Read obstacles_3d_world.parquet and emit per-track trajectories.
