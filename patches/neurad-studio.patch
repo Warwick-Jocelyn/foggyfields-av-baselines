@@ -1,5 +1,5 @@
 diff --git a/nerfstudio/configs/dataparser_configs.py b/nerfstudio/configs/dataparser_configs.py
-index f7459a1d..eb27fc60 100644
+index f7459a1..eb27fc6 100644
 --- a/nerfstudio/configs/dataparser_configs.py
 +++ b/nerfstudio/configs/dataparser_configs.py
 @@ -25,6 +25,7 @@ from nerfstudio.data.dataparsers.argoverse2_dataparser import Argoverse2DataPars
@@ -20,10 +20,10 @@ index f7459a1d..eb27fc60 100644
  try:
 diff --git a/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
 new file mode 100644
-index 00000000..d6c38db2
+index 0000000..edfcff3
 --- /dev/null
 +++ b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,685 @@
 +# Copyright 2024 the authors of NeuRAD and contributors.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,6 +69,7 @@ index 00000000..d6c38db2
 +    ADDataParser,
 +    ADDataParserConfig,
 +)
++from nerfstudio.utils.rich_utils import CONSOLE
 +
 +# Camera order is fixed; sensor_idx is the index into this tuple.
 +NVIDIA_AV_FOG_CAMERAS: Tuple[str, ...] = (
@@ -82,6 +83,18 @@ index 00000000..d6c38db2
 +)
 +
 +NVIDIA_AV_FOG_LIDAR: str = "lidar_top_360fov"
++
++# The seven cameras are NOT exposed simultaneously. They split into two trigger groups
++# with a large, systematic offset from the LiDAR spin centre (measured on the released
++# clips, see DATASET_NOTES.md "F1"):
++#   group A: front_wide, rear_left, rear_right, front_tele
++#   group B: cross_left, cross_right, rear_tele
++# Intra-group jitter is +-0.1 ms; the inter-group gap reaches 16.9 ms (NFF-01), which is
++# 15.5 cm of ego motion at 32.9 km/h. Never reuse the LiDAR timestamp for a camera.
++NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS: Tuple[Tuple[str, ...], Tuple[str, ...]] = (
++    ("camera_front_wide_120fov", "camera_rear_left_70fov", "camera_rear_right_70fov", "camera_front_tele_30fov"),
++    ("camera_cross_left_120fov", "camera_cross_right_120fov", "camera_rear_tele_30fov"),
++)
 +
 +# NCore native rig: +x=left, +y=forward, +z=up.
 +# ISO 8855:        +x=forward, +y=left,    +z=up.
@@ -201,6 +214,22 @@ index 00000000..d6c38db2
 +    2026-10-12), so "sensor" (= use the points as-is) is the geometrically correct setting. Default stays
 +    "ego" to reproduce the published runs exactly."""
 +
++    camera_timestamp_source: Literal["auto", "per_camera", "lidar"] = "auto"
++    """Where the per-image capture time comes from.
++
++    ``per_camera`` (and ``auto`` when the data supports it) reads the REAL per-camera
++    timestamps, in this order:
++      1. ``calib/camera_timestamps.parquet`` (``timestep_idx`` + one column per camera),
++      2. ``videos/<cam>.timestamps.parquet`` column ``timestamp``, matched to each LiDAR
++         spin centre by nearest neighbour (exactly the frame-selection rule the dataset
++         converter used to pick the rectified frame).
++    ``lidar`` reproduces the ORIGINAL, DEFECTIVE behaviour -- every camera inherits the
++    LiDAR spin-centre timestamp. Keep it only to re-create pre-fix runs on purpose; it
++    costs up to 16.9 ms of timing error (~15.5 cm of ego motion at 32.9 km/h) and it also
++    corrupts dynamic-actor pose interpolation, which is done in time.
++    ``auto`` = ``per_camera`` if either source exists, else hard error (it never silently
++    degrades to the LiDAR timestamp)."""
++
 +    use_valid_masks: bool = False
 +    """If True, attach ``masks/<cam>/valid_mask.png`` (the ftheta->pinhole valid region) as the
 +    per-image mask so the black rectification corners are excluded from the RGB loss and from
@@ -219,7 +248,8 @@ index 00000000..d6c38db2
 +    T_camera_rig: Dict[str, np.ndarray] = field(default_factory=dict)   # 4x4, p_cam = T @ p_ego
 +    T_lidar_rig: np.ndarray = field(default_factory=lambda: np.eye(4))  # 4x4, p_lidar = T @ p_ego
 +    T_rig_world: np.ndarray = field(default_factory=lambda: np.zeros((0, 4, 4)))  # [T,4,4] p_world = T @ p_ego
-+    timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds
++    timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds (LiDAR spin centre)
++    camera_timestamps_us: Dict[str, np.ndarray] = field(default_factory=dict)    # cam -> [T] microseconds
 +    num_timesteps: int = 0
 +    # Per-camera/lidar metadata for split lookup:
 +    _cam_timestep: List[int] = field(default_factory=list)
@@ -264,6 +294,7 @@ index 00000000..d6c38db2
 +        self.T_rig_world = Trw
 +        self.timestamps_us = pose_df["timestamp_us"].to_numpy().astype(np.int64)
 +        self.num_timesteps = T
++        self.camera_timestamps_us = self._load_camera_timestamps()
 +        # If a fixed split file was requested, load timestep indices for it.
 +        self._train_timesteps, self._eval_timesteps = self._load_split_indices()
 +        outputs = super()._generate_dataparser_outputs(split)
@@ -276,6 +307,118 @@ index 00000000..d6c38db2
 +            if missing:
 +                raise FileNotFoundError(f"use_valid_masks=True but masks are missing: {missing}")
 +        return outputs
++
++    # ----- Timing -----------------------------------------------------------------
++
++    def _spin_centers_us(self) -> np.ndarray:
++        """LiDAR spin-centre timestamp per timestep [T] (microseconds)."""
++        lt = self.clip_root / "calib" / "lidar_timestamps.parquet"
++        if lt.exists():
++            df = pd.read_parquet(lt)
++            if "spin_center_us" in df.columns:
++                sort_col = "sweep_idx" if "sweep_idx" in df.columns else df.columns[0]
++                df = df.sort_values(sort_col)
++                return df["spin_center_us"].to_numpy().astype(np.int64)
++        # T_rig_world.timestamp_us is the same quantity (the converter writes spin_center there).
++        return self.timestamps_us.astype(np.int64)
++
++    def _load_camera_timestamps(self) -> Dict[str, np.ndarray]:
++        """Per-camera capture timestamps, [T] microseconds, one entry per camera.
++
++        F1. The original implementation gave every camera the LiDAR spin-centre
++        timestamp. The cameras are in fact triggered in two groups (see
++        ``NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS``) with a systematic offset from the spin
++        centre. Measured medians (group A / group B):
++
++            NFF-01  +2.74 / -14.17 ms      NCF-02  -4.71 / -15.75 ms
++            NFF-07  +5.59 / -11.31 ms      NCF-08  -0.28 /  -2.31 ms
++
++        Worst inter-group gap 16.91 ms = 15.5 cm of ego motion at 32.9 km/h (~23 cm at
++        49 km/h), and it propagates into dynamic-actor pose interpolation, which is
++        keyed on time.
++        """
++        cams = tuple(NVIDIA_AV_FOG_CAMERAS)
++        src = self.config.camera_timestamp_source
++        spin = self._spin_centers_us()
++
++        if src == "lidar":
++            CONSOLE.print(
++                "[bold red]NVIDIA_AV_FOG: camera_timestamp_source='lidar' -- every camera is being given the "
++                "LiDAR spin-centre timestamp. This is the PRE-FIX (defective) behaviour and is only here to "
++                "re-create superseded runs. Up to 16.9 ms / 15.5 cm of camera timing error.[/bold red]"
++            )
++            return {c: spin.copy() for c in cams}
++
++        ts: Dict[str, np.ndarray] = {}
++        origin = "unknown"
++
++        cam_ts_path = self.clip_root / "calib" / "camera_timestamps.parquet"
++        if cam_ts_path.exists():
++            df = pd.read_parquet(cam_ts_path)
++            if "timestep_idx" in df.columns:
++                df = df.sort_values("timestep_idx").reset_index(drop=True)
++            missing = [c for c in cams if c not in df.columns]
++            if missing:
++                raise ValueError(
++                    f"{cam_ts_path} exists but is missing camera column(s) {missing}. "
++                    f"Columns present: {list(df.columns)}"
++                )
++            if len(df) != self.num_timesteps:
++                raise ValueError(
++                    f"{cam_ts_path} has {len(df)} rows but the clip has {self.num_timesteps} timesteps."
++                )
++            ts = {c: df[c].to_numpy().astype(np.int64) for c in cams}
++            origin = "calib/camera_timestamps.parquet"
++        else:
++            video_dir = self.clip_root / "videos"
++            per_cam_files = {c: video_dir / f"{c}.timestamps.parquet" for c in cams}
++            if not all(f.exists() for f in per_cam_files.values()):
++                raise FileNotFoundError(
++                    "F1: real per-camera timestamps are required but were not found.\n"
++                    f"  looked for {cam_ts_path}\n"
++                    f"  and for    {video_dir}/<cam>.timestamps.parquet\n"
++                    "Re-run the dataset converter so one of them exists, or pass "
++                    "`--camera-timestamp-source lidar` to deliberately reproduce the superseded, "
++                    "defective behaviour (up to 16.9 ms of camera timing error)."
++                )
++            for c, f in per_cam_files.items():
++                col = pd.read_parquet(f)["timestamp"].to_numpy().astype(np.int64)
++                # Same frame-selection rule the converter used to pick the rectified frame:
++                # argmin |camera timestamp - lidar spin_center_us|.
++                idx = np.abs(col[None, :] - spin[:, None]).argmin(axis=1)
++                ts[c] = col[idx]
++            origin = "videos/<cam>.timestamps.parquet (nearest to spin centre)"
++
++        self._log_camera_timing(ts, spin, origin)
++        return ts
++
++    def _log_camera_timing(self, ts: Dict[str, np.ndarray], spin: np.ndarray, origin: str) -> None:
++        """Sanity-check block: per-camera offset vs the LiDAR spin centre, and the gap
++        between the two trigger groups. Also hard-fails on implausible offsets."""
++        frame_period_us = 33_331.0  # 30 Hz cameras; measured median inter-frame delta
++        CONSOLE.log(f"NVIDIA_AV_FOG camera timestamps: source = {origin}")
++        medians: Dict[str, float] = {}
++        for c in NVIDIA_AV_FOG_CAMERAS:
++            d = (ts[c].astype(np.float64) - spin.astype(np.float64)) / 1000.0  # ms
++            medians[c] = float(np.median(d))
++            CONSOLE.log(
++                f"  {c:30s} offset vs spin centre: median {medians[c]:+8.3f} ms, "
++                f"p05 {np.percentile(d, 5):+8.3f}, p95 {np.percentile(d, 95):+8.3f} ms"
++            )
++            if np.abs(d).max() > frame_period_us / 1000.0:
++                raise ValueError(
++                    f"Camera {c} timestamp is more than one frame period from the LiDAR spin centre "
++                    f"(max |offset| = {np.abs(d).max():.1f} ms). The timestamp source is probably on a "
++                    f"different clock than calib/lidar_timestamps.parquet -- refusing to guess."
++                )
++        ga = [medians[c] for c in NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS[0] if c in medians]
++        gb = [medians[c] for c in NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS[1] if c in medians]
++        if ga and gb:
++            gap = abs(float(np.median(ga)) - float(np.median(gb)))
++            CONSOLE.log(
++                f"  trigger-group gap: {gap:.2f} ms "
++                f"(group A median {np.median(ga):+.2f}, group B median {np.median(gb):+.2f} ms)"
++            )
 +
 +    # ----- ADDataParser overrides -------------------------------------------------
 +
@@ -294,8 +437,10 @@ index 00000000..d6c38db2
 +
 +        for t in range(self.num_timesteps):
 +            T_rig_world_t = Rwrot @ self.T_rig_world[t]  # 4x4
-+            ts_seconds = float(self.timestamps_us[t]) * 1e-6
 +            for slot, cam_name in enumerate(cams):
++                # F1: the capture time is the CAMERA's own timestamp, not the LiDAR
++                # spin centre. See _load_camera_timestamps().
++                ts_seconds = float(self.camera_timestamps_us[cam_name][t]) * 1e-6
 +                K_info = self.K_per_cam[cam_name]
 +                K = np.array([
 +                    [K_info["fx"], 0.0,           K_info["cx"]],
@@ -565,7 +710,7 @@ index 00000000..d6c38db2
 +        raise FileNotFoundError(f"No processed_pinhole/ under {candidates[0]}")
 +    return clip
 diff --git a/nerfstudio/models/splatad.py b/nerfstudio/models/splatad.py
-index dd1b2099..c21ef407 100644
+index dd1b209..c21ef40 100644
 --- a/nerfstudio/models/splatad.py
 +++ b/nerfstudio/models/splatad.py
 @@ -846,8 +846,13 @@ class SplatADModel(ADModel):
@@ -585,7 +730,7 @@ index dd1b2099..c21ef407 100644
          vels_in_world = None
          b2w_per_pt = boxes2world.index_select(dim=0, index=curr_ids)
 diff --git a/nerfstudio/utils/eval_utils.py b/nerfstudio/utils/eval_utils.py
-index 83f2d8bd..fbfe80ef 100644
+index 83f2d8b..fbfe80e 100644
 --- a/nerfstudio/utils/eval_utils.py
 +++ b/nerfstudio/utils/eval_utils.py
 @@ -60,7 +60,7 @@ def eval_load_checkpoint(
@@ -598,7 +743,7 @@ index 83f2d8bd..fbfe80ef 100644
          loaded_state["pipeline"].pop(key, None)
  
 diff --git a/nerfstudio/utils/math.py b/nerfstudio/utils/math.py
-index 7c9b11de..077826cc 100644
+index 7c9b11d..077826c 100644
 --- a/nerfstudio/utils/math.py
 +++ b/nerfstudio/utils/math.py
 @@ -760,12 +760,16 @@ def chamfer_distance(
