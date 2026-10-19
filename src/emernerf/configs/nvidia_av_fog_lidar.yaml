@@ -14,6 +14,11 @@ data:
     downscale: 1
     num_cams: 7
     test_image_stride: 2
+    # Rectification v1/v2. "auto" uses v2 (per-camera K at native angular resolution)
+    # when the clip has it. apply_safe_crop crops away the black lens-cone border and
+    # takes cx/cy from inside the safe_crop block. See RECTIFY_V2.md.
+    rectification: auto
+    apply_safe_crop: true
     load_rgb: True
     load_sky_mask: False
     load_dynamic_mask: False

@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from nerfstudio.cameras.cameras import Cameras, CameraType
+from nerfstudio.cameras.cameras import Cameras, CameraType, RollingShutterLookup
 from nerfstudio.cameras.lidars import Lidars, LidarType
 from nerfstudio.data.dataparsers.ad_dataparser import (
     DUMMY_DISTANCE_VALUE,
@@ -232,19 +232,24 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     time_to_center_pixel: float = 0.0
     """Offset from the stored image timestamp to the time the CENTRE row is read out.
 
-    DELIBERATELY LEFT AT 0, AND THIS IS AN OPEN QUESTION -- see the PR body.
-    nerfstudio's ray generator computes
+    0 IS THE RIGHT VALUE HERE, but only because the dataset says so. nerfstudio computes
         time_offset(row) = (row / height - 0.5) * rolling_shutter_time + time_to_center_pixel
-    so a non-zero value is needed exactly when the dataset's ``timestamp`` column means
-    the START of the frame rather than its CENTRE. We could not establish which it is:
-    the dataset documents neither, and NVIDIA's DriveWorks image-timestamp struct carries
-    BOTH a start-of-frame field and a frame-midpoint field, so which one the NCore export
-    wrote is a converter detail that is not visible from the released files.
+    so a non-zero value is needed exactly when the image timestamp means the START of the
+    frame rather than its CENTRE. NVIDIA documents neither, and the DriveWorks image
+    timestamp struct carries both a start-of-frame and a frame-midpoint field, so which
+    one the NCore export wrote is not visible from the released files.
 
-    If you establish that ``timestamp`` is start-of-frame, set this to
-    ``shutter_delay_us / 2 * 1e-6 = 0.0152795``. Leaving it at 0 is the correct choice
-    under the centre-of-frame reading and is a half-readout (15.3 ms) error under the
-    other -- which would be comparable to F1, so it is worth resolving."""
+    What settles it is the dataset's own `calib/rs_time_offset/README.json`, which states
+    the per-pixel offsets are "seconds, relative to the frame exposure timestamp in
+    calib/camera_timestamps.parquet (mid-frame readout)" and derives them as
+    `(row/src_h - 0.5) * shutter_delay_us`, symmetric about 0 (+-15.279 ms). The loaded
+    tables agree: their medians are -3.4 ms on the 120 deg cameras and -0.1 ms on the
+    teles, i.e. centred, not offset by a half readout.
+
+    That is the dataset toolkit's assertion about NVIDIA's timestamps, not NVIDIA's own
+    statement, so it is a documented assumption rather than a proof. If it is ever
+    contradicted, the start-of-frame value would be shutter_delay_us/2 = 0.0152795, and
+    the loader warns if README.json stops saying "mid-frame"."""
 
     splits_json: Literal["reconstruction_all", "nvs_50_50", "nvs_80_20", "nvs_90_10", "auto"] = "auto"
     """If not 'auto', read ``processed_pinhole/splits/<name>.json`` directly. Otherwise
@@ -335,10 +340,42 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     ``auto`` = ``per_camera`` if either source exists, else hard error (it never silently
     degrades to the LiDAR timestamp)."""
 
-    use_valid_masks: bool = False
-    """If True, attach ``masks/<cam>/valid_mask.png`` (the ftheta->pinhole valid region) as the
-    per-image mask so the black rectification corners are excluded from the RGB loss and from
-    the model's own eval metrics. Off by default to stay faithful to the published runs."""
+    use_valid_masks: bool = True
+    """Attach the per-camera valid-region mask (``masks[_rectv2]/<cam>/valid_mask.png``) so the
+    black rectification corners stay out of the RGB loss and out of the model's own eval
+    metrics. NOW ON BY DEFAULT: the v2 valid region is not rectangular, so even with
+    ``apply_safe_crop`` there is no setting in which training on the invalid pixels is
+    correct. False reproduces the superseded runs."""
+
+    # ---- rectification v2 ------------------------------------------------------------
+    rectification: Literal["auto", "v1", "v2"] = "auto"
+    """Which rectification to train on.
+
+    v1 put all seven cameras on ONE virtual pinhole (fx=fy=640, 1280x960, 90 deg FOV),
+    which cost the 30 deg teles 5.8x of angular resolution and left 95% of their canvas
+    empty. v2 gives each camera its own K at that lens's native angular resolution
+    (``calib/K_rectified_v2.json``, ``images_rectv2/``), 11.2 -> 65.2 px/deg on the front
+    tele. ``auto`` picks v2 when the clip has it, else v1. See RECTIFY_V2.md."""
+
+    apply_safe_crop: bool = True
+    """v2 only. Crop each image to the ``safe_crop`` rectangle from
+    ``K_rectified_v2.json`` -- the largest rectangle containing zero invalid pixels -- and
+    take cx/cy from INSIDE that block (fx/fy are unaffected by the crop). Without this the
+    black lens-cone corners of the v2 canvas enter the loss for any pipeline that ignores
+    masks. Reading the top-level w/h instead of the safe_crop block is the specific
+    mistake this flag exists to prevent."""
+
+    rs_time_offset_lookup: bool = True
+    """Use ``calib/rs_time_offset/<cam>.npy`` (per-output-pixel readout time, stored at 1/8
+    resolution, sampled bilinearly) in place of the row-linear rolling-shutter formula.
+    Rectification smears one v2 output row across a median of 104 source rows (max 178) of
+    1080 on the 120 deg cameras = 2.93 ms (max 5.05), 35 px on the 70 deg, 7 px on the
+    teles -- real, but smaller than F1's 16.9 ms. Silently inactive when the files are
+    absent; they are being generated and exist in no clip yet."""
+
+    image_cache_warn_gb: float = 32.0
+    """Log a warning when the projected image cache exceeds this. v2 is up to 2692x1880,
+    4.1x the pixels of v1, and nerfstudio caches every training image."""
 
 
 @dataclass
@@ -350,6 +387,10 @@ class NvidiaAvFog(ADDataParser):
     # Populated in _generate_dataparser_outputs() before the parent runs:
     clip_root: Path = Path()  # processed_pinhole/ for the chosen sequence
     K_per_cam: Dict[str, Dict] = field(default_factory=dict)
+    rect_version: str = "v1"          # "v1" | "v2", resolved by _select_rectification()
+    images_dirname: str = "images"
+    masks_dirname: str = "masks"
+    labels_2d_dirname: str = "labels"
     T_camera_rig: Dict[str, np.ndarray] = field(default_factory=dict)   # 4x4, p_cam = T @ p_ego
     T_lidar_rig: np.ndarray = field(default_factory=lambda: np.eye(4))  # 4x4, p_lidar = T @ p_ego
     T_rig_world: np.ndarray = field(default_factory=lambda: np.zeros((0, 4, 4)))  # [T,4,4] p_world = T @ p_ego
@@ -377,7 +418,6 @@ class NvidiaAvFog(ADDataParser):
             data_root = type(self.config).__dataclass_fields__["data"].default
         self.clip_root = _resolve_clip_root(data_root, self.config.sequence)
         # Load all calibration once.
-        self.K_per_cam = json.loads((self.clip_root / "calib" / "K_rectified.json").read_text())
         T_cam_raw = json.loads((self.clip_root / "calib" / "T_camera_rig.json").read_text())
         self.T_camera_rig = {k: _list_to_4x4(v) for k, v in T_cam_raw.items()}
         T_lid_raw = json.loads((self.clip_root / "calib" / "T_lidar_rig.json").read_text())
@@ -393,6 +433,7 @@ class NvidiaAvFog(ADDataParser):
         self.T_rig_world = Trw
         self.timestamps_us = pose_df["timestamp_us"].to_numpy().astype(np.int64)
         self.num_timesteps = T
+        self._select_rectification()
         self.camera_timestamps_us = self._load_camera_timestamps()
         self._apply_rolling_shutter_config()
         self.lidar_frame = self._resolve_lidar_frame()
@@ -400,14 +441,226 @@ class NvidiaAvFog(ADDataParser):
         self._train_timesteps, self._eval_timesteps = self._load_split_indices()
         outputs = super()._generate_dataparser_outputs(split)
         if self.config.use_valid_masks:
-            # image path is <clip_root>/images/<cam>/frame_XXXX.jpg -> mask is per-camera, time-invariant
+            # image path is <clip_root>/<images_dirname>/<cam>/frame_XXXX.jpg
+            # -> the mask is per-camera and time-invariant
             outputs.mask_filenames = [
-                self.clip_root / "masks" / Path(f).parent.name / "valid_mask.png" for f in outputs.image_filenames
+                self.clip_root / self.masks_dirname / Path(f).parent.name / "valid_mask.png"
+                for f in outputs.image_filenames
             ]
             missing = [m for m in set(outputs.mask_filenames) if not m.exists()]
             if missing:
                 raise FileNotFoundError(f"use_valid_masks=True but masks are missing: {missing}")
+        self._attach_image_crops(outputs)
+        outputs.metadata["rectification"] = self.rect_version
+        outputs.metadata["labels_2d_dir"] = self.clip_root / self.labels_2d_dirname
+        self._attach_rolling_shutter_lookup(outputs)
         return outputs
+
+    def _attach_image_crops(self, outputs) -> None:
+        """Hand the per-image safe crop to InputDataset.
+
+        The crop has to happen at image load, not in the dataparser: the reported
+        width/height and the principal point describe the CROPPED image, so the pixels
+        must be cropped to match. ``metadata["image_crops"]`` is [N, 4] = (x, y, w, h) in
+        original canvas pixels, aligned with ``image_filenames``.
+        """
+        # Resolved per filename (the camera is the image's parent directory), so this is
+        # immune to however the train/eval split reorders the images.
+        crops = [tuple(self.K_per_cam[Path(f).parent.name]["crop"]) for f in outputs.image_filenames]
+        if not crops or all(c[0] == 0 and c[1] == 0 for c in crops):
+            return  # nothing to crop (v1, or safe_crop disabled)
+        outputs.metadata["image_crops"] = torch.tensor(crops, dtype=torch.int32)
+        x, y, w, h = crops[0]
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG safe crop active: e.g. ({x}, {y}) {w}x{h} out of the full v2 canvas "
+            f"({len(set(crops))} distinct crops across {len(crops)} images)"
+        )
+
+    def _attach_rolling_shutter_lookup(self, outputs) -> None:
+        """Per-output-pixel readout time from ``calib/rs_time_offset/``.
+
+        ``calib/rs_time_offset/README.json`` documents the format, and the loader asserts
+        against it rather than assuming::
+
+            units   seconds, relative to the exposure timestamp in camera_timestamps.parquet
+            stride  8
+            grid    small[y, x] = t at v2 canvas pixel (min(8*y, h-1), min(8*x, w-1))
+            upsample  cv2.remap(small, x/8, y/8, INTER_LINEAR, BORDER_REPLICATE)
+            derivation  v2 pixel -> ray -> incidence angle -> angle_to_pixeldist_poly ->
+                        f-theta source row -> t = (row/src_h - 0.5) * shutter_delay_us
+
+        `RollingShutterLookup` reproduces that upsample exactly (bilinear in canvas-index
+        space, replicated border), so no table is materialised at full resolution.
+
+        Two things this has to get right and the naive reading does not:
+          * the tables live on the FULL v2 canvas, not on the safe crop, so the crop
+            origin is passed in as an offset;
+          * the measured spread is real but modest -- 2.7 ms median / 5.0 ms max on the
+            120 deg cameras, 1.0 / 1.9 on the 70 deg, 0.17 / 0.41 on the teles -- i.e.
+            well under F1's 16.9 ms. This is a refinement, not the main event.
+        """
+        if not self.config.rs_time_offset_lookup:
+            return
+        d = self.clip_root / "calib" / "rs_time_offset"
+        if not d.is_dir():
+            return
+        readme = {}
+        readme_path = d / "README.json"
+        if readme_path.exists():
+            readme = json.loads(readme_path.read_text())
+            stride_doc = float(readme.get("stride", 8))
+            if "mid-frame" not in str(readme.get("units", "")):
+                CONSOLE.print(
+                    f"[bold yellow]NVIDIA_AV_FOG: {readme_path} no longer says the offsets are "
+                    f"relative to a mid-frame timestamp ('{readme.get('units')}'). "
+                    f"time_to_center_pixel={self.config.time_to_center_pixel} may now be wrong."
+                    f"[/bold yellow]"
+                )
+        else:
+            stride_doc = 8.0
+
+        cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
+        tables: Dict[int, torch.Tensor] = {}
+        strides: Dict[int, float] = {}
+        offsets: Dict[int, Tuple[int, int]] = {}
+        for slot, cam in enumerate(cams):
+            f = d / f"{cam}.npy"
+            if not f.exists():
+                CONSOLE.print(
+                    f"[bold yellow]NVIDIA_AV_FOG: {f} missing; rolling-shutter lookup disabled.[/bold yellow]"
+                )
+                return
+            arr = np.load(f).astype(np.float32)
+            if arr.ndim != 2:
+                raise ValueError(f"{f}: expected a 2-D table, got shape {arr.shape}")
+            K = self.K_per_cam[cam]
+            x0, y0, _, _ = K["crop"]
+            canvas_h, canvas_w = K["canvas_h"], K["canvas_w"]
+            # the table covers the canvas at `stride`, with the last sample clamped
+            exp_h = int(np.ceil(canvas_h / stride_doc))
+            exp_w = int(np.ceil(canvas_w / stride_doc))
+            if not (abs(arr.shape[0] - exp_h) <= 1 and abs(arr.shape[1] - exp_w) <= 1):
+                raise ValueError(
+                    f"{f}: table {arr.shape} does not cover a {canvas_h}x{canvas_w} canvas at "
+                    f"stride {stride_doc:g} (expected ~{exp_h}x{exp_w}). Refusing to sample it."
+                )
+            span = float(np.nanmax(arr) - np.nanmin(arr))
+            # Units guard. The tables overshoot the nominal +-shutter_delay/2 a little
+            # because rays near the canvas edge extrapolate past the source image, so the
+            # bound is loose; it exists to catch microseconds-instead-of-seconds, which
+            # would be off by 1e6.
+            limit = 2.0 * self.config.rolling_shutter_time if self.config.rolling_shutter_time > 0 else 0.1
+            if span > limit + 1e-6:
+                raise ValueError(
+                    f"{f}: readout times span {span * 1e3:.1f} ms, more than the {limit * 1e3:.1f} ms "
+                    f"bound implied by the published readout time. Wrong units?"
+                )
+            CONSOLE.log(
+                f"  rs_time_offset {cam:30s} {arr.shape} min/med/max = "
+                f"{np.nanmin(arr) * 1e3:+7.3f} / {np.nanmedian(arr) * 1e3:+7.3f} / "
+                f"{np.nanmax(arr) * 1e3:+7.3f} ms"
+            )
+            tables[slot] = torch.from_numpy(arr)
+            strides[slot] = stride_doc
+            offsets[slot] = (int(x0), int(y0))
+        outputs.cameras.metadata["rs_time_offset_lookup"] = RollingShutterLookup(tables, strides, offsets)
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG: rolling-shutter LOOKUP active for {len(tables)} cameras, stride "
+            f"{stride_doc:g}, crop-aware; it replaces the row-linear formula. A median near 0 ms "
+            f"above confirms the image timestamp is mid-readout (so time_to_center_pixel=0)."
+        )
+
+    # ----- Rectification version ---    # ----- Rectification version ----------------------------------------------------
+
+    def _select_rectification(self) -> None:
+        """Pick v1 or v2 and load the matching intrinsics.
+
+        v2 ships per-camera intrinsics and a ``safe_crop`` block::
+
+            "camera_front_wide_120fov": {
+              "fx": 942.66, "fy": 942.66, "cx": 1345.5, "cy": 1345.5, "w": 2692, "h": 1864,
+              "safe_crop": {"x": 0, "y": 351, "w": 2692, "h": 1338, "cx": 1345.5, "cy": 994.5}
+            }
+
+        The top-level ``w``/``h`` describe the FULL canvas, which still has black at the
+        lens-cone boundary. ``safe_crop`` is the largest rectangle with zero invalid
+        pixels; ``fx``/``fy`` are unchanged by the crop but ``cx``/``cy`` must come from
+        inside the block.
+        """
+        k2 = self.clip_root / "calib" / "K_rectified_v2.json"
+        has_v2 = k2.exists() and (self.clip_root / "images_rectv2").is_dir()
+        want = self.config.rectification
+        if want == "v2" and not has_v2:
+            raise FileNotFoundError(
+                f"rectification='v2' but {self.clip_root.name} has no v2 data "
+                f"({k2} / images_rectv2/). Only some clips have been re-rectified; use "
+                f"`--rectification auto` or `v1`."
+            )
+        use_v2 = has_v2 if want == "auto" else (want == "v2")
+
+        if use_v2:
+            self.rect_version = "v2"
+            self.images_dirname, self.masks_dirname = "images_rectv2", "masks_rectv2"
+            self.labels_2d_dirname = "labels_rectv2"
+            raw = json.loads(k2.read_text())
+        else:
+            self.rect_version = "v1"
+            self.images_dirname, self.masks_dirname = "images", "masks"
+            self.labels_2d_dirname = "labels"
+            raw = json.loads((self.clip_root / "calib" / "K_rectified.json").read_text())
+
+        self.K_per_cam = {}
+        for cam, K in raw.items():
+            entry = {"fx": float(K["fx"]), "fy": float(K["fy"]),
+                     "cx": float(K["cx"]), "cy": float(K["cy"]),
+                     "w": int(K["w"]), "h": int(K["h"]),
+                     # full canvas, before any crop -- the rs_time_offset tables live on it
+                     "canvas_w": int(K["w"]), "canvas_h": int(K["h"]),
+                     "crop": (0, 0, int(K["w"]), int(K["h"]))}
+            crop = K.get("safe_crop")
+            if self.rect_version == "v2" and self.config.apply_safe_crop:
+                if crop is None:
+                    raise ValueError(
+                        f"apply_safe_crop=True but {k2} has no safe_crop block for {cam}. "
+                        f"Pass `--apply-safe-crop False` to train on the full canvas (and keep "
+                        f"`--use-valid-masks True`, or the black corners enter the loss)."
+                    )
+                entry.update(cx=float(crop["cx"]), cy=float(crop["cy"]),
+                             w=int(crop["w"]), h=int(crop["h"]),
+                             crop=(int(crop["x"]), int(crop["y"]), int(crop["w"]), int(crop["h"])))
+            self.K_per_cam[cam] = entry
+
+        cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG rectification: {self.rect_version} "
+            f"(images {self.images_dirname}/, masks {self.masks_dirname}/, "
+            f"2-D labels {self.labels_2d_dirname}/, safe_crop="
+            f"{self.config.apply_safe_crop and self.rect_version == 'v2'})"
+        )
+        for cam in cams:
+            K = self.K_per_cam[cam]
+            CONSOLE.log(
+                f"  {cam:30s} {K['w']}x{K['h']}  fx={K['fx']:8.2f} cx={K['cx']:7.1f} cy={K['cy']:7.1f} "
+                f"({K['fx'] * np.pi / 180.0:.1f} px/deg on axis)"
+            )
+        self._warn_about_image_cache(cams)
+
+    def _warn_about_image_cache(self, cams: Tuple[str, ...]) -> None:
+        """v2 raises the resolution up to 2692x1880 (4.1x v1's pixels) and nerfstudio caches
+        every training image in RAM, so say the number out loud before it OOMs."""
+        px = sum(self.K_per_cam[c]["w"] * self.K_per_cam[c]["h"] for c in cams) * self.num_timesteps
+        gb_f32, gb_u8 = px * 3 * 4 / 1024**3, px * 3 / 1024**3
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG image cache (all {self.num_timesteps} timesteps x {len(cams)} cameras): "
+            f"{gb_f32:.1f} GB as float32, {gb_u8:.1f} GB as uint8; ~half that for a 50/50 split"
+        )
+        if gb_f32 / 2 > self.config.image_cache_warn_gb:
+            CONSOLE.print(
+                f"[bold yellow]NVIDIA_AV_FOG: the train split alone needs ~{gb_f32 / 2:.0f} GB of "
+                f"float32 image cache. Use `--pipeline.datamanager.cache-images-type uint8` "
+                f"(~{gb_u8 / 2:.0f} GB), `--pipeline.datamanager.cache-images cpu`, and/or "
+                f"`--pipeline.datamanager.camera-res-scale-factor 0.5` (4x less).[/bold yellow]"
+            )
 
     # ----- Timing -----------------------------------------------------------------
 
@@ -575,7 +828,8 @@ class NvidiaAvFog(ADDataParser):
             f"NVIDIA_AV_FOG rolling shutter: TOP_TO_BOTTOM, readout {unique[0] * 1e3:.3f} ms "
             f"({100.0 * unique[0] / frame_period:.1f}% of the 33.3 ms frame period); "
             f"time_to_center_pixel = {self.config.time_to_center_pixel} s "
-            f"(0 = the image timestamp is assumed to be the CENTRE of the frame; see F2 in the PR)"
+            f"(0 = the image timestamp is the CENTRE of the frame, per "
+            f"calib/rs_time_offset/README.json: 'mid-frame readout')"
         )
 
     # ----- LiDAR frame --------------------------------------------------------------
@@ -709,12 +963,16 @@ class NvidiaAvFog(ADDataParser):
 
                 intrinsics.append(K)
                 c2ws.append(c2w)
+                # v2 + apply_safe_crop: w/h/cx/cy already describe the CROPPED image; the
+                # crop itself is handed to InputDataset via metadata["image_crops"].
                 widths.append(int(K_info["w"]))
                 heights.append(int(K_info["h"]))
                 times.append(ts_seconds)
                 sensor_idxs.append(slot)
                 timestep_record.append(t)
-                image_filenames.append(self.clip_root / "images" / cam_name / f"frame_{t:04d}.jpg")
+                image_filenames.append(
+                    self.clip_root / self.images_dirname / cam_name / f"frame_{t:04d}.jpg"
+                )
 
         intrinsics_t = torch.tensor(np.stack(intrinsics), dtype=torch.float32)
         c2ws_t = torch.tensor(np.stack(c2ws), dtype=torch.float32)

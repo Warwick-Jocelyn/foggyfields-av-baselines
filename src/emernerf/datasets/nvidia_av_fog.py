@@ -79,7 +79,9 @@ NVIDIA_AV_FOG_CAMERAS_ALL = [
     "camera_rear_tele_30fov",     # 6: rear-tele
 ]
 
-# Per-camera native resolution (h, w). Index matches NVIDIA_AV_FOG_CAMERAS_ALL.
+# v1 per-camera rectified resolution (h, w). Kept for reference only -- the real source
+# size now comes from the selected K (see resolve_rectification), because v2 is per-camera
+# and the safe crop changes it again.
 NATIVE_HW: Dict[str, Tuple[int, int]] = {
     "camera_front_wide_120fov":   (960, 1280),
     "camera_cross_left_120fov":   (960, 1280),
@@ -213,6 +215,55 @@ def resolve_lidar_frame(clip_dir: str, forced: str = "auto",
     )
 
 
+def resolve_rectification(clip_dir: str, want: str = "auto", apply_safe_crop: bool = True):
+    """Pick the rectification version and return (version, dirs, K, crops).
+
+    v1 rectified all seven cameras onto ONE virtual pinhole (fx=fy=640, 1280x960), which
+    cost the 30 deg teles 5.8x of angular resolution. v2 gives each camera its own K at
+    its native angular resolution (``calib/K_rectified_v2.json``, ``images_rectv2/``).
+
+    v2's canvas still has black at the lens-cone boundary, so each entry carries a
+    ``safe_crop`` -- the largest rectangle with zero invalid pixels. Crop to it and take
+    cx/cy from INSIDE that block; fx/fy are unchanged by the crop. Reading the top-level
+    w/h instead is the specific mistake this exists to prevent.
+
+    Returns
+    -------
+    version   "v1" | "v2"
+    images_dirname, labels_2d_dirname
+    K         {cam: {fx, fy, cx, cy, w, h}}   (already crop-adjusted)
+    crops     {cam: (x, y, w, h)}             in canvas pixels
+    """
+    k2 = os.path.join(clip_dir, "calib", "K_rectified_v2.json")
+    has_v2 = os.path.exists(k2) and os.path.isdir(os.path.join(clip_dir, "images_rectv2"))
+    if want == "v2" and not has_v2:
+        raise FileNotFoundError(
+            f"rectification='v2' but {clip_dir} has no v2 data. Only some clips have been "
+            f"re-rectified; use 'auto' or 'v1'."
+        )
+    use_v2 = has_v2 if want == "auto" else (want == "v2")
+    if use_v2:
+        version, images_dirname, labels_2d = "v2", "images_rectv2", "labels_rectv2"
+        raw = json.load(open(k2))
+    else:
+        version, images_dirname, labels_2d = "v1", "images", "labels"
+        raw = json.load(open(os.path.join(clip_dir, "calib", "K_rectified.json")))
+
+    K, crops = {}, {}
+    for cam, k in raw.items():
+        entry = {"fx": float(k["fx"]), "fy": float(k["fy"]), "cx": float(k["cx"]),
+                 "cy": float(k["cy"]), "w": int(k["w"]), "h": int(k["h"])}
+        crop = (0, 0, int(k["w"]), int(k["h"]))
+        if version == "v2" and apply_safe_crop:
+            sc = k.get("safe_crop")
+            if sc is None:
+                raise ValueError(f"{k2}: no safe_crop block for {cam}; set apply_safe_crop=false.")
+            entry.update(cx=float(sc["cx"]), cy=float(sc["cy"]), w=int(sc["w"]), h=int(sc["h"]))
+            crop = (int(sc["x"]), int(sc["y"]), int(sc["w"]), int(sc["h"]))
+        K[cam], crops[cam] = entry, crop
+    return version, images_dirname, labels_2d, K, crops
+
+
 # ===========================================================================
 # Pixel source
 # ===========================================================================
@@ -290,17 +341,28 @@ class NVIDIAAVFogPixelSource(ScenePixelSource):
                 f"num_cams={self.num_cams} not supported for nvidia_av_fog"
             )
         self._cam_names = cam_names
-        # Fill per-slot native resolution so intrinsic scaling is correct.
-        self.ORIGINAL_SIZE = [list(NATIVE_HW[c]) for c in cam_names]
 
         scene_path = Path(self.data_path)
+        # Rectification v1/v2 selection (per-camera K + safe crop); see resolve_rectification.
+        (self.rect_version, self.images_dirname, self.labels_2d_dirname,
+         self._K_rect, self._crops) = resolve_rectification(
+            str(scene_path),
+            want=str(getattr(self.data_cfg, "rectification", "auto")),
+            apply_safe_crop=bool(getattr(self.data_cfg, "apply_safe_crop", True)),
+        )
+        logger.info(
+            f"[NVIDIA_AV_Fog] rectification {self.rect_version} "
+            f"(images {self.images_dirname}/, 2-D labels {self.labels_2d_dirname}/)"
+        )
+        # per-slot source resolution comes from the chosen K, not a hardcoded table
+        self.ORIGINAL_SIZE = [[self._K_rect[c]["h"], self._K_rect[c]["w"]] for c in cam_names]
         img_filepaths, dynamic_mask_filepaths, sky_mask_filepaths, feat_filepaths = (
             [], [], [], []
         )
         for t in range(self.start_timestep, self.end_timestep):
             for slot_idx, cam_name in enumerate(cam_names):
                 img_filepaths.append(
-                    str(scene_path / "images" / cam_name / f"frame_{t:04d}.jpg")
+                    str(scene_path / self.images_dirname / cam_name / f"frame_{t:04d}.jpg")
                 )
                 dynamic_mask_filepaths.append("")
                 sky_mask_filepaths.append("")
@@ -311,10 +373,34 @@ class NVIDIAAVFogPixelSource(ScenePixelSource):
         self.feat_filepaths = np.array(feat_filepaths)
 
     # ------------------------------------------------------------------
+    def load_rgb(self) -> None:
+        """Crop-aware override of ScenePixelSource.load_rgb.
+
+        Identical to the base implementation except that each image is cropped to its
+        camera's ``safe_crop`` BEFORE being resized to ``load_size``. Without this the
+        black rectification corners of the v2 canvas would be trained on, and the
+        intrinsics (which use the cropped cx/cy) would not match the pixels.
+        """
+        if not self.data_cfg.load_rgb:
+            return
+        from PIL import Image
+        from tqdm import tqdm as _tqdm
+
+        load_h, load_w = self.data_cfg.load_size[0], self.data_cfg.load_size[1]
+        images = []
+        for fname in _tqdm(self.img_filepaths, desc="Loading images", dynamic_ncols=True):
+            rgb = Image.open(fname).convert("RGB")
+            x, y, w, h = self._crops[Path(fname).parent.name]
+            if (x, y, w, h) != (0, 0, rgb.width, rgb.height):
+                rgb = rgb.crop((x, y, x + w, y + h))
+            images.append(rgb.resize((load_w, load_h), Image.BILINEAR))
+        self.images = torch.from_numpy(np.stack(images, axis=0)) / 255
+        self.img_ids = torch.arange(len(self.images)).long()
+
+    # ------------------------------------------------------------------
     def load_calibrations(self):
         scene_path = Path(self.data_path)
-        with open(scene_path / "calib" / "K_rectified.json") as f:
-            K_all = json.load(f)
+        K_all = self._K_rect  # crop-adjusted, from resolve_rectification()
         with open(scene_path / "calib" / "T_camera_rig.json") as f:
             T_cam_rig_all = json.load(f)
         # T_rig_world (NCore native ego→world per timestep)
@@ -335,7 +421,9 @@ class NVIDIAAVFogPixelSource(ScenePixelSource):
         _intrinsics = []
         for slot_idx, cam_name in enumerate(self._cam_names):
             K = K_all[cam_name]
-            native_h, native_w = NATIVE_HW[cam_name]
+            # The source size is the CROPPED size when safe_crop is on, so the intrinsic
+            # scaling to load_size has to use it (not a hardcoded native resolution).
+            native_h, native_w = int(K["h"]), int(K["w"])
             sx = load_w / native_w
             sy = load_h / native_h
             fx, fy = K["fx"] * sx, K["fy"] * sy

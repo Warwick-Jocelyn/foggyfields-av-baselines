@@ -15,6 +15,11 @@ data:
     downscale: 1
     num_cams: 7                     # rear_left, FL, F, FR, rear_right, front_tele, rear_tele
     test_image_stride: 2            # NVS-50/50 style (every other frame to val)
+    # Rectification v1/v2. "auto" uses v2 (per-camera K at native angular resolution)
+    # when the clip has it. apply_safe_crop crops away the black lens-cone border and
+    # takes cx/cy from inside the safe_crop block. See RECTIFY_V2.md.
+    rectification: auto
+    apply_safe_crop: true
     load_rgb: True
     load_sky_mask: False            # masks/<cam>/valid_mask.png is rectification validity, not sky
     load_dynamic_mask: False
