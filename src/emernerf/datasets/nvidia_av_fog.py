@@ -1,9 +1,11 @@
 """NVIDIA_AV_Fog dataparser for EmerNeRF.
 
-Reads the user's NVIDIA Physical AI AV fog clips at
-  /networkhome/WMGDS/wang3_y/ETH/Dataset/NVIDIA_AV_Fog/processed/<clip>/processed_pinhole/
+Reads the NVIDIA Physical AI AV clips in either of the two on-disk layouts
+(see ``_resolve_clip_dir``):
+  <data_root>/clips/NFF-01__b9ea7a9d/                                  live
+  <data_root>/processed/<clip>/processed_pinhole/                      legacy
 
-Per-clip layout (processed_pinhole/):
+Per-clip layout:
   images/<cam>/frame_NNNN.jpg              7 cams, NNNN in 0000..0198
   lidar/sweep_NNNN.npy                      [N,6] float32, EGO frame
                                             cols = [x, y, z, intensity, t_offset_us, ring_id]
@@ -98,26 +100,58 @@ ISO_8855_T4[:3, :3] = ISO_8855_R
 
 
 def _resolve_clip_dir(data_root: str, scene_idx) -> str:
-    """Resolve <data_root>/processed/<NNN>_*_/processed_pinhole by clip-prefix match.
+    """Resolve a clip directory, supporting both on-disk layouts.
 
-    scene_idx may be an int (002) or a str ("002") — both work.
+    Live layout::
+
+        <data_root>/clips/NFF-01__b9ea7a9d/
+        <data_root>/NVIDIA_FOGGY_Field/clips/NFF-01__b9ea7a9d/     (parent root)
+
+    Legacy layout (what the published runs used)::
+
+        <data_root>/processed/002_<uuid>_fog_day_rural/processed_pinhole/
+
+    ``scene_idx`` matches the exact directory name, the clip id before ``__``
+    (``NFF-01``), the hash after it, or -- legacy only -- a 3-digit prefix (``002``).
     """
-    if isinstance(scene_idx, int):
-        prefix = f"{scene_idx:03d}"
-    else:
-        prefix = str(scene_idx).zfill(3)
-    processed_root = os.path.join(data_root, "processed")
-    matches = sorted(glob(os.path.join(processed_root, f"{prefix}_*")))
-    # filter to directories (skip *.md, *.log siblings)
-    matches = [m for m in matches if os.path.isdir(m)]
-    if not matches:
-        raise FileNotFoundError(
-            f"No clip dir found at {processed_root}/{prefix}_*"
-        )
+    sel = f"{scene_idx:03d}" if isinstance(scene_idx, int) else str(scene_idx)
+
+    roots = []
+    if os.path.isdir(os.path.join(data_root, "clips")):
+        roots.append(os.path.join(data_root, "clips"))
+    for subset in ("NVIDIA_FOGGY_Field", "NVIDIA_CLEAR_Field"):
+        cand = os.path.join(data_root, subset, "clips")
+        if os.path.isdir(cand):
+            roots.append(cand)
+
+    matches = []
+    for root in roots:
+        for name in sorted(os.listdir(root)):
+            full = os.path.join(root, name)
+            if not os.path.isdir(full):
+                continue
+            clip_id, _, clip_hash = name.partition("__")
+            if sel in (name, clip_id, clip_hash) or clip_id.lower() == sel.lower():
+                matches.append(full)
+    if len(matches) == 1:
+        return matches[0]
     if len(matches) > 1:
-        logger.warning(f"Multiple clip dirs match prefix {prefix}: {matches}; using {matches[0]}")
-    clip_dir = matches[0]
-    pin = os.path.join(clip_dir, "processed_pinhole")
+        raise ValueError(f"scene_idx {sel!r} matches multiple clips: {matches}")
+
+    # ---- legacy layout ----
+    processed_root = os.path.join(data_root, "processed")
+    if not os.path.isdir(processed_root):
+        raise FileNotFoundError(
+            f"{data_root} has neither clips/ (live layout) nor processed/ (legacy layout); "
+            f"scene_idx={sel!r}"
+        )
+    prefix = sel.zfill(3)
+    legacy = [m for m in sorted(glob(os.path.join(processed_root, f"{prefix}_*"))) if os.path.isdir(m)]
+    if not legacy:
+        raise FileNotFoundError(f"No clip dir found at {processed_root}/{prefix}_*")
+    if len(legacy) > 1:
+        logger.warning(f"Multiple clip dirs match prefix {prefix}: {legacy}; using {legacy[0]}")
+    pin = os.path.join(legacy[0], "processed_pinhole")
     if not os.path.isdir(pin):
         raise FileNotFoundError(f"{pin} does not exist (clip {prefix})")
     return pin

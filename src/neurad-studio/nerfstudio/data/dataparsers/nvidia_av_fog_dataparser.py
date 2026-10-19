@@ -13,17 +13,14 @@
 # limitations under the License.
 """Data parser for the NVIDIA_AV_Fog dataset (5 fog-daytime clips derived from NVIDIA NCore).
 
-Layout expected under ``--data``::
+Two on-disk layouts are supported under ``--data`` (see ``_resolve_clip_root``)::
 
-    <data>/
-      processed/
-        002_<uuid>_fog_day_rural/processed_pinhole/{images,lidar,labels,splits,calib,...}
-        003_<uuid>_fog_day_residual/processed_pinhole/...
-        004_<uuid>_fog_day_highway_with_cars/processed_pinhole/...
-        ...
+    <data>/clips/NFF-01__b9ea7a9d/{images,lidar,labels,splits,calib,videos,...}   # live
+    <data>/NVIDIA_FOGGY_Field/clips/NFF-01__b9ea7a9d/...                          # live, parent root
+    <data>/processed/002_<uuid>_fog_day_rural/processed_pinhole/...               # legacy
 
-Use ``--sequence`` to pick a clip (matched by leading-digit prefix or by uuid prefix,
-e.g. ``002`` or ``b9ea7a9d``).
+Use ``--sequence`` to pick a clip: ``NFF-01``, ``b9ea7a9d``, the full directory name, or
+-- legacy layout only -- a leading 3-digit prefix such as ``002``.
 """
 
 import json
@@ -129,10 +126,13 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     """
 
     _target: Type = field(default_factory=lambda: NvidiaAvFog)
-    data: Path = Path("/networkhome/WMGDS/wang3_y/ETH/Dataset/NVIDIA_AV_Fog")
-    """Root of the NVIDIA_AV_Fog dataset (contains processed/<clip>/...)."""
-    sequence: str = "002"
-    """Clip prefix or uuid prefix selecting a clip under processed/."""
+    data: Path = Path("/home/wang3_y_WMGDS.WMG.WARWICK.AC.UK/Dataset/physicalai_av/NVIDIA_FOGGY_Field")
+    """Dataset root. Either a subset root holding ``clips/`` (live layout), a parent holding
+    ``NVIDIA_FOGGY_Field/clips`` and/or ``NVIDIA_CLEAR_Field/clips``, or a legacy root
+    holding ``processed/<clip>/processed_pinhole``."""
+    sequence: str = "NFF-01"
+    """Clip selector: ``NFF-01`` / ``NCF-08``, the hash, the full directory name, or a
+    legacy 3-digit prefix such as ``002``."""
 
     cameras: Tuple[
         Literal[
@@ -655,31 +655,77 @@ def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
 
 
 def _resolve_clip_root(data_root: Path, sequence: str) -> Path:
-    """Find <data_root>/processed/<clip_prefix><sequence>...<rest>/processed_pinhole.
+    """Locate a clip directory under ``data_root``, supporting both on-disk layouts.
 
-    Matches either by leading 3-digit prefix (``002``) or by uuid prefix (``b9ea7a9d``).
+    Live layout (what the dataset actually ships today)::
+
+        <data_root>/clips/NFF-01__b9ea7a9d/{images,lidar,labels,calib,videos,splits,...}
+
+    ``data_root`` may also be the parent that holds several subsets, in which case both
+    ``NVIDIA_FOGGY_Field/clips`` and ``NVIDIA_CLEAR_Field/clips`` are searched::
+
+        <data_root>/NVIDIA_FOGGY_Field/clips/NFF-01__b9ea7a9d/
+
+    Legacy layout (kept working; it is what the published runs used)::
+
+        <data_root>/processed/002_<uuid>_fog_day_rural/processed_pinhole/
+
+    ``sequence`` matches, in order of preference: the exact directory name, the clip id
+    before ``__`` (``NFF-01``), the hash after ``__`` (``b9ea7a9d``), or -- legacy only --
+    a leading 3-digit prefix (``002``). An ambiguous match is an error, never a guess.
     """
+    roots: List[Path] = []
+    if (data_root / "clips").is_dir():
+        roots.append(data_root / "clips")
+    for subset in ("NVIDIA_FOGGY_Field", "NVIDIA_CLEAR_Field"):
+        if (data_root / subset / "clips").is_dir():
+            roots.append(data_root / subset / "clips")
+
+    candidates: List[Path] = []
+    for root in roots:
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            name = child.name
+            clip_id, _, clip_hash = name.partition("__")
+            if sequence in (name, clip_id, clip_hash) or clip_id.lower() == sequence.lower():
+                candidates.append(child)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Sequence '{sequence}' matches multiple clips: {[str(c) for c in candidates]}. "
+            "Use the full directory name."
+        )
+    if roots:
+        available = sorted(c.name for root in roots for c in root.iterdir() if c.is_dir())
+        if not (data_root / "processed").exists():
+            raise ValueError(f"Sequence '{sequence}' not found under {[str(r) for r in roots]}. Available: {available}")
+
+    # ---- legacy processed/<clip>/processed_pinhole/ layout ----
     processed = data_root / "processed"
     if not processed.exists():
-        raise FileNotFoundError(f"No 'processed/' dir under {data_root}")
-    candidates = []
+        raise FileNotFoundError(
+            f"{data_root} has neither a 'clips/' directory (live layout) nor a 'processed/' "
+            f"directory (legacy layout)."
+        )
+    legacy = []
     for child in sorted(processed.iterdir()):
         if not child.is_dir():
             continue
-        name = child.name
-        if name.startswith(f"{sequence}_") or sequence in name:
-            candidates.append(child)
-    if not candidates:
+        if child.name.startswith(f"{sequence}_") or sequence in child.name:
+            legacy.append(child)
+    if not legacy:
         raise ValueError(
             f"Sequence '{sequence}' not found under {processed}. "
             f"Available: {[c.name for c in sorted(processed.iterdir()) if c.is_dir()]}"
         )
-    if len(candidates) > 1:
+    if len(legacy) > 1:
         raise ValueError(
-            f"Sequence '{sequence}' matches multiple clips: {[c.name for c in candidates]}. "
-            f"Use a longer/more specific prefix."
+            f"Sequence '{sequence}' matches multiple clips: {[c.name for c in legacy]}. "
+            "Use a longer/more specific prefix."
         )
-    clip = candidates[0] / "processed_pinhole"
+    clip = legacy[0] / "processed_pinhole"
     if not clip.exists():
-        raise FileNotFoundError(f"No processed_pinhole/ under {candidates[0]}")
+        raise FileNotFoundError(f"No processed_pinhole/ under {legacy[0]}")
     return clip
