@@ -359,10 +359,10 @@ index 0000000..067fd61
 +print("================================")
 diff --git a/datasets/nvidia_av_fog.py b/datasets/nvidia_av_fog.py
 new file mode 100644
-index 0000000..64b8147
+index 0000000..57ce1f5
 --- /dev/null
 +++ b/datasets/nvidia_av_fog.py
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,922 @@
 +"""NVIDIA_AV_Fog dataparser for EmerNeRF.
 +
 +Reads the NVIDIA Physical AI AV clips in either of the two on-disk layouts
@@ -386,10 +386,8 @@ index 0000000..64b8147
 +Coordinate convention:
 +  Source dataset frames (NCore native): +x left, +y forward, +z up.
 +  EmerNeRF AD convention:               +x forward, +y left, +z up.
-+  We apply ISO 8855 rotation R = [[0,1,0],[1,0,0],[0,0,1]] to all WORLD-frame poses
-+  (so the canonical "world" is the start-of-clip ego frame, ISO-aligned). LiDAR
-+  points are loaded in ego frame and transformed through the same ISO-rotated
-+  lidar_to_world transform, so all modalities live in the same world frame.
++  No remap is applied: the released frames are already ISO 8855. The canonical
++  "world" is simply the start-of-clip ego frame.
 +
 +Heterogeneous camera resolutions:
 +  Three different native sizes (1280x960, 1120x800, 480x320). EmerNeRF's base
@@ -457,13 +455,11 @@ index 0000000..64b8147
 +    "camera_rear_tele_30fov":     (320,  480),
 +}
 +
-+# ISO 8855 axis remap: NCore (+x left, +y fwd, +z up) → AD (+x fwd, +y left, +z up).
-+# This is a permutation matrix (swap x and y) — its own inverse.
-+ISO_8855_R = np.array([[0.0, 1.0, 0.0],
-+                       [1.0, 0.0, 0.0],
-+                       [0.0, 0.0, 1.0]], dtype=np.float64)
-+ISO_8855_T4 = np.eye(4, dtype=np.float64)
-+ISO_8855_T4[:3, :3] = ISO_8855_R
++# NOTE: an "ISO 8855 axis remap" [[0,1,0],[1,0,0],[0,0,1]] used to be defined here.
++# Its determinant is -1 -- it is a REFLECTION, not a rotation, and applying it mirrored
++# the scene (which is why it was disabled). The released data is already ISO 8855
++# (+x forward, +y left, +z up), so no remap is needed; the matrix is deleted rather than
++# left available to switch on.
 +
 +
 +def _resolve_clip_dir(data_root: str, scene_idx) -> str:
@@ -691,11 +687,10 @@ index 0000000..64b8147
 +            str(scene_path / "calib" / "T_rig_world.parquet")
 +        )  # (T, 4, 4)
 +
-+        # The processed_pinhole world frame is already ISO 8855 (T_rig_world
-+        # translation grows along world +x = forward; obstacles_3d_world is in
-+        # the same frame). Premultiplying by ISO_8855_T4 used to mirror-reflect
-+        # everything (det=-1) and scrambled poses. Use the native frame directly.
-+        ego_to_world_iso = ego_to_world_native  # (T,4,4) -- already ISO
++        # The world frame is already ISO 8855 (T_rig_world's translation grows along
++        # world +x = forward; obstacles_3d_world is in the same frame), so it is used
++        # directly.
++        ego_to_world_iso = ego_to_world_native
 +        ego_to_world_start = ego_to_world_iso[self.start_timestep]
 +        inv_start = np.linalg.inv(ego_to_world_start)
 +        self.inv_start_ego_to_world = inv_start  # shared with LiDAR source
@@ -754,8 +749,9 @@ index 0000000..64b8147
 +
 +    .npy sweeps are stored in the EGO frame at spin_center timestamp t. We
 +    transform each point to world coordinates via
-+        p_world = inv_start @ ISO_8855_T4 @ T_rig_world[t] @ p_ego
-+    (i.e. ego→native_world→ISO_world→canonical_world). The same compound
++        p_world = inv_start @ T_rig_world[t] @ p_ego
++    (i.e. ego→world→canonical_world; the world frame is already ISO 8855 so there is
++    no remap step). The same compound
 +    transform IS the lidar_to_world we expose; lidar = ego here because
 +    T_lidar_rig is so close to identity (translation only) we treat the
 +    lidar's origin as the ego origin for ray-bookkeeping, then we apply the
@@ -822,7 +818,7 @@ index 0000000..64b8147
 +        ego_to_world_native = _load_rig_world_poses(
 +            str(scene_path / "calib" / "T_rig_world.parquet")
 +        )  # (T,4,4)
-+        ego_to_world_iso = ego_to_world_native  # already ISO 8855; no extra rotation
++        ego_to_world_iso = ego_to_world_native  # already ISO 8855
 +        # canonical_from_world @ world_from_ego @ ego_from_lidar = canonical_from_lidar
 +        l2ws = []
 +        for t in range(self.start_timestep, self.end_timestep):

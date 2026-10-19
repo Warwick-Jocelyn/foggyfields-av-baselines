@@ -67,20 +67,14 @@ NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS: Tuple[Tuple[str, ...], Tuple[str, ...]] = (
     ("camera_cross_left_120fov", "camera_cross_right_120fov", "camera_rear_tele_30fov"),
 )
 
-# NCore native rig: +x=left, +y=forward, +z=up.
-# ISO 8855:        +x=forward, +y=left,    +z=up.
-# Rotation that takes a point's NCore-frame coords to ISO coords:
-#     p_iso = R_iso_from_ncore @ p_ncore
-# Derivation:
-#     x_iso (fwd)  = y_ncore (fwd)
-#     y_iso (left) = x_ncore (left)
-#     z_iso (up)   = z_ncore (up)
-R_ISO_FROM_NCORE = np.array(
-    [[0.0, 1.0, 0.0],
-     [1.0, 0.0, 0.0],
-     [0.0, 0.0, 1.0]],
-    dtype=np.float64,
-)
+# NOTE: a 3x3 "ISO 8855" remap used to live here as
+#     R_ISO_FROM_NCORE = [[0,1,0],[1,0,0],[0,0,1]]
+# It has determinant -1 -- a REFLECTION, not a rotation, so it would have mirrored the
+# scene rather than rotated it. It was already unused (apply_iso_8855_rotation defaulted
+# to False) because the released data is ALREADY in ISO 8855: CONVENTIONS.md specifies
+# +x forward / +y left / +z up for the ego and world frames, and T_rig_world's
+# translation grows along world +x. No remap is needed, so the matrix and its config
+# flag are deleted rather than left lying around for someone to switch on.
 
 # NCore LiDAR sweep `[N,6]` columns: x, y, z, intensity (already 0-1), t_offset_us, ring_id.
 LIDAR_SWEEP_COL_X = 0
@@ -252,13 +246,6 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     under the centre-of-frame reading and is a half-readout (15.3 ms) error under the
     other -- which would be comparable to F1, so it is worth resolving."""
 
-    apply_iso_8855_rotation: bool = False
-    """If True, apply ``R_iso_from_ncore`` to all world-frame poses (cam, lidar, cuboid).
-    The processed_pinhole/ data is already in ISO 8855 (T_rig_world translation
-    grows along world +x = forward; obstacles_3d_world is in the same world frame),
-    so the default is now False. KNOWN_ISSUES I-003 refers to obstacles_3d_*ego*.parquet
-    only — we read the _world_ variant."""
-
     splits_json: Literal["reconstruction_all", "nvs_50_50", "nvs_80_20", "nvs_90_10", "auto"] = "auto"
     """If not 'auto', read ``processed_pinhole/splits/<name>.json`` directly. Otherwise
     defer to the parent class' LINSPACE split (which matches ``nvs_50_50`` for
@@ -377,17 +364,6 @@ class NvidiaAvFog(ADDataParser):
     # Per-camera/lidar metadata for split lookup:
     _cam_timestep: List[int] = field(default_factory=list)
     _lidar_timestep: List[int] = field(default_factory=list)
-
-    # ----- World-frame conventions ------------------------------------------------
-
-    @property
-    def _world_rotation(self) -> np.ndarray:
-        """4x4 transform: world_iso = R_iso_from_world @ world_ncore (identity if disabled)."""
-        if not self.config.apply_iso_8855_rotation:
-            return np.eye(4)
-        T = np.eye(4)
-        T[:3, :3] = R_ISO_FROM_NCORE
-        return T
 
     # ----- Dataset entrypoint ----------------------------------------------------
 
@@ -699,7 +675,6 @@ class NvidiaAvFog(ADDataParser):
 
     def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
         cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
-        Rwrot = self._world_rotation  # 4x4
 
         intrinsics: List[np.ndarray] = []
         c2ws: List[np.ndarray] = []
@@ -711,7 +686,7 @@ class NvidiaAvFog(ADDataParser):
         timestep_record: List[int] = []
 
         for t in range(self.num_timesteps):
-            T_rig_world_t = Rwrot @ self.T_rig_world[t]  # 4x4
+            T_rig_world_t = self.T_rig_world[t]  # 4x4; the world frame is already ISO 8855
             for slot, cam_name in enumerate(cams):
                 # F1: the capture time is the CAMERA's own timestamp, not the LiDAR
                 # spin centre. See _load_camera_timestamps().
@@ -771,13 +746,12 @@ class NvidiaAvFog(ADDataParser):
         return cameras, image_filenames
 
     def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
-        Rwrot = self._world_rotation
         # T_lidar_rig.json also stores T_rig_from_lidar (= lidar->rig); see camera comment above.
         # Translation (1.14, 0, 1.94) m = lidar position on rig (roof-mounted, forward of center).
         lidar_to_rig = self.T_lidar_rig
         poses, times, idxs, filenames, timestep_record = [], [], [], [], []
         for t in range(self.num_timesteps):
-            T_rig_world_t = Rwrot @ self.T_rig_world[t]
+            T_rig_world_t = self.T_rig_world[t]
             l2w = T_rig_world_t @ lidar_to_rig
             ts_seconds = float(self.timestamps_us[t]) * 1e-6
             poses.append(l2w)
@@ -973,9 +947,6 @@ class NvidiaAvFog(ADDataParser):
         df = pd.read_parquet(df_path)
         if not len(df):
             return []
-        Rwrot = self._world_rotation[:3, :3]
-        twrot = self._world_rotation[:3, 3]
-
         df = df.assign(label_class=df["label_class"].str.lower())
         df = self._filter_actor_classes(df)
         if not len(df):
@@ -1004,12 +975,9 @@ class NvidiaAvFog(ADDataParser):
 
             poses = np.tile(np.eye(4)[None, :, :], (n, 1, 1)).astype(np.float64)
             for i in range(n):
-                R = _quat_to_R(qx[i], qy[i], qz[i], qw[i])
-                # Apply world rotation: p_iso = Rwrot @ p_ncore
-                R_world = Rwrot @ R
-                t_world = Rwrot @ np.array([cx[i], cy[i], cz[i]]) + twrot
-                poses[i, :3, :3] = R_world
-                poses[i, :3, 3] = t_world
+                # obstacles_3d_world is already expressed in the (ISO 8855) world frame.
+                poses[i, :3, :3] = _quat_to_R(qx[i], qy[i], qz[i], qw[i])
+                poses[i, :3, 3] = np.array([cx[i], cy[i], cz[i]])
 
             timestamps_s = ts_seconds[ti]
             # dims: PandaSet convention is (width, length, height). NCore stores (size_x=length,
