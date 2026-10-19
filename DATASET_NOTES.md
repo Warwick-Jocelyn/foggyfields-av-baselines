@@ -56,24 +56,57 @@ are triggered in **two groups**:
 * group A — `front_wide`, `rear_left`, `rear_right`, `front_tele`
 * group B — `cross_left`, `cross_right`, `rear_tele`
 
-Median offset from `spin_center_us` (group A / group B):
+**The gap is clip-specific — do not assume a constant.** Measured over all 32 released
+clips, the median offset from `spin_center_us` per group:
 
-| clip | group A | group B | gap |
+| clip | group A | group B | gap | | clip | group A | group B | gap |
+|---|---|---|---|---|---|---|---|---|
+| NFF-01 | +2.74 | −14.17 | 16.91 | | NCF-01 | +14.33 | −15.44 | **29.77** |
+| NFF-07 | +5.59 | −11.31 | 16.91 | | NCF-02 | −4.71 | −15.75 | 11.04 |
+| NFF-11 | +6.54 | −14.54 | 21.08 | | **NCF-03** | +16.05 | +16.06 | **0.01** |
+| NFF-14 | +10.27 | −9.16 | 19.43 | | **NCF-04** | −2.20 | −2.14 | **0.06** |
+| NFF-13 | +8.60 | +7.80 | 0.80 | | NCF-08 | −0.28 | −2.31 | 2.04 |
+| NFF-03 | −10.85 | −3.49 | 7.36 | | NCF-14 | −7.05 | +8.00 | 15.05 |
+
+(ms. Group B is ahead of A on some clips and behind on others.)
+
+Across all 32 clips: per-camera offset spans **−15.75 … +16.06 ms**; the inter-group gap
+spans **0.01 … 29.77 ms**. On NCF-03 and NCF-04 the two groups effectively coincide.
+Intra-group jitter stays at ±0.1 ms, so each group has one well-defined time.
+
+Converted with each clip's own ego speed (p95), the worst inter-group displacements are:
+
+| clip | gap | ego speed | displacement |
 |---|---|---|---|
-| NFF-01 | +2.74 ms | −14.17 ms | 16.91 ms |
-| NFF-07 | +5.59 ms | −11.31 ms | 16.91 ms |
-| NCF-02 | −4.71 ms | −15.75 ms | 11.04 ms |
-| NCF-08 | −0.28 ms | −2.31 ms | 2.04 ms |
+| NFF-14 | 19.43 ms | 120 km/h | **65 cm** |
+| NFF-01 | 16.91 ms | 121 km/h | 57 cm |
+| NCF-01 | 29.77 ms | 67 km/h | 55 cm |
+| NFF-10 | 16.91 ms | 96 km/h | 45 cm |
 
-Intra-group jitter is ±0.1 ms, so this is a fixed per-group bias. The worst gap,
-16.91 ms, is **15.5 cm** of ego motion at 32.9 km/h and ~23 cm at 49 km/h. It also
-corrupts dynamic-actor pose interpolation, which is keyed on time.
+It also corrupts dynamic-actor pose interpolation, which is keyed on time.
 
 Real timestamps: `calib/camera_timestamps.parquet` (`timestep_idx` + one column per
 camera, plus `<cam>_src_frame`), or `videos/<cam>.timestamps.parquet` column
 `timestamp` matched to each spin centre by `argmin |t_cam − spin_center_us|`.
 `calib/camera_timestamps_offsets.json` states the same offsets independently
 (NCF-08: −0.279 / −2.318 ms, `group_spread_ms` 2.041) — our loader reproduces them.
+As of 2026-10-19 `calib/camera_timestamps.parquet` exists on 25 of 32 clips; the rest
+fall back to the video timestamps, which give the same answer to 0.001 ms.
+
+### How each codebase uses the per-camera time
+
+* **NeuRAD / SplatAD** — `Cameras.times` is per image, so the camera is posed at its own
+  instant and, with F2 on, each ray additionally gets its row's readout time. Full
+  sub-frame modelling.
+* **EmerNeRF** — has no rolling-shutter model, so there is nothing to give a *per-ray*
+  time to. It does have a per-image `timestamp` that is normalised and drives the
+  dynamic/flow branch, and that was an integer timestep shared by all seven cameras.
+  It is now the camera's own time in frame units,
+  `(t_cam − spin_center[start]) / frame_period`, so the two trigger groups are no longer
+  modelled as simultaneous. On NCF-01 the seven cameras now span 0.30 of a frame; on
+  NCF-03, where the groups coincide, 0.0003. The LiDAR source was moved onto the same
+  clock so the two modalities share one definition of t=0 and of the unit.
+  `data.pixel_source.camera_timestamp_source: lidar` restores the old integer behaviour.
 
 ## F2 — rolling shutter IS published
 
@@ -147,7 +180,8 @@ elevations — which drives the ray-drop model. Beam divergence genuinely is not
 published; the Pandar64 values remain as a stated assumption.
 
 `lidar/range_image/` (128 × 3600 with explicit non-returns) is being generated and will
-replace the inferred missing rays. It does not exist in any clip yet.
+replace the inferred missing rays. It does not exist in any clip yet, so the loader
+treats its absence as normal and falls back silently.
 
 ## Verified correct — do NOT "fix" these
 
@@ -176,4 +210,5 @@ the v2 valid region is not rectangular. See `NVIDIA_CLEAR_Field/RECTIFY_V2.md`.
 on the **full canvas** (not the safe crop), bilinear-upsampled at load. Rectification
 smears one v2 output row across a median of ~96 source rows (max 177) of 1080 on the
 120° cameras = 2.7 ms (max 5.0), ~35 px on the 70° cameras, ~6 px on the teles. Real,
-but **smaller than F1's 16.9 ms** — F1 matters more.
+but generally **smaller than F1** (16.06 ms per camera, 29.77 ms between groups) — F1
+matters more. The tables exist on 25 of 32 clips as of 2026-10-19.

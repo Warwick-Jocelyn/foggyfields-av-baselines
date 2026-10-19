@@ -9,7 +9,7 @@
 >
 > | | defect | measured magnitude |
 > |---|---|---|
-> | **F1** | every camera was given the LiDAR spin-centre timestamp instead of its own | up to **16.91 ms** of camera timing error = **15.5 cm** of ego motion at 32.9 km/h (~23 cm at 49 km/h); also mistimed dynamic-actor interpolation |
+> | **F1** | every camera was given the LiDAR spin-centre timestamp instead of its own | up to **16.06 ms** per camera and **29.77 ms** between the two trigger groups (clip-specific); worst measured ego displacement **65 cm** (NFF-14, 19.43 ms at 120 km/h); also mistimed dynamic-actor interpolation |
 > | **F3** | sensor-frame LiDAR points were transformed as if they were ego-frame | **1.94 m** vertical offset — the world-frame ground sat at −1.94 m instead of 0 |
 >
 > F1 affects RGB and LiDAR equally (the cameras are posed at the wrong instant).

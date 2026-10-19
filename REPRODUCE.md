@@ -30,8 +30,9 @@ Data sources (both **private**, request access):
 
 Six dataparser defects (F1–F6) were fixed on `fix/camera-timing-lidar-frame-v2`. Every
 number in `RESULTS.md` and `results/metrics/**` predates that and is **superseded** —
-chiefly by **F1** (up to 16.91 ms of camera timing error = 15.5 cm of ego motion at
-32.9 km/h) and **F3** (a 1.94 m vertical LiDAR offset). Full detail in `DATASET_NOTES.md`.
+chiefly by **F1** (clip-specific camera timing error, up to 16.06 ms per camera and
+29.77 ms between trigger groups — 65 cm of ego motion on NFF-14) and **F3** (a 1.94 m
+vertical LiDAR offset). Full detail in `DATASET_NOTES.md`.
 
 The corrected behaviour is the **default**: `ns-train ... nvidia-av-fog-data --sequence
 NFF-01` with no further flags already does the right thing. The old behaviour is

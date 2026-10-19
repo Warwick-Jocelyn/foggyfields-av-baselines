@@ -15,6 +15,9 @@ Per-clip layout:
   calib/T_camera_rig.json                   per-cam 4x4 = p_cam = T @ p_ego  (cam_from_ego)
   calib/T_lidar_rig.json                    {"lidar_top_360fov": 4x4 = lidar_from_ego}
   calib/T_rig_world.parquet                 per-frame ego->world (3x4, 199 rows)
+  calib/camera_timestamps.parquet           per-camera capture time (F1); the 7 cameras
+                                            are NOT simultaneous -- see
+                                            load_camera_timestamps_us()
   splits/{nvs_50_50,nvs_80_20,nvs_90_10,reconstruction_all}.json
   timestamps.txt                            one int per line (spin_center_us per timestep)
 
@@ -264,6 +267,70 @@ def resolve_rectification(clip_dir: str, want: str = "auto", apply_safe_crop: bo
     return version, images_dirname, labels_2d, K, crops
 
 
+def load_spin_centers_us(clip_dir: str) -> np.ndarray:
+    """LiDAR spin-centre timestamp per timestep, microseconds."""
+    lt = os.path.join(clip_dir, "calib", "lidar_timestamps.parquet")
+    if os.path.exists(lt):
+        df = pd.read_parquet(lt)
+        if "spin_center_us" in df.columns:
+            sort_col = "sweep_idx" if "sweep_idx" in df.columns else df.columns[0]
+            return df.sort_values(sort_col)["spin_center_us"].to_numpy().astype(np.int64)
+    df = pd.read_parquet(os.path.join(clip_dir, "calib", "T_rig_world.parquet"))
+    return df.sort_values("timestep_idx")["timestamp_us"].to_numpy().astype(np.int64)
+
+
+def load_camera_timestamps_us(clip_dir: str, cam_names, source: str = "auto") -> Dict[str, np.ndarray]:
+    """F1. Per-camera capture timestamps in microseconds, one [T] array per camera.
+
+    The seven cameras are triggered in two groups whose offset from the LiDAR spin
+    centre is CLIP-SPECIFIC: measured over all 32 released clips the inter-group gap
+    runs from 0.01 ms (NCF-03, the groups coincide) to 29.77 ms (NCF-01), and the sign
+    flips between clips. So the timestamps have to be read per clip; there is no
+    constant to hardcode and no typical value to assume.
+
+    Sources, in order: ``calib/camera_timestamps.parquet``, then
+    ``videos/<cam>.timestamps.parquet`` matched to each spin centre by
+    ``argmin |t_cam - spin_center_us|`` (the converter's own frame-selection rule).
+    ``source="lidar"`` reinstates the old behaviour of giving every camera the spin
+    centre.
+    """
+    spin = load_spin_centers_us(clip_dir)
+    if source == "lidar":
+        logger.warning(
+            "[NVIDIA_AV_Fog] camera_timestamp_source='lidar': every camera is being given the "
+            "LiDAR spin-centre timestamp. This is the PRE-FIX behaviour; the real per-camera "
+            "offsets reach 29.77 ms between trigger groups."
+        )
+        return {c: spin.copy() for c in cam_names}
+
+    ct = os.path.join(clip_dir, "calib", "camera_timestamps.parquet")
+    if os.path.exists(ct):
+        df = pd.read_parquet(ct)
+        if "timestep_idx" in df.columns:
+            df = df.sort_values("timestep_idx").reset_index(drop=True)
+        missing = [c for c in cam_names if c not in df.columns]
+        if missing:
+            raise ValueError(f"{ct} is missing camera column(s) {missing}")
+        if len(df) != len(spin):
+            raise ValueError(f"{ct} has {len(df)} rows but the clip has {len(spin)} timesteps")
+        return {c: df[c].to_numpy().astype(np.int64) for c in cam_names}
+
+    out = {}
+    for c in cam_names:
+        f = os.path.join(clip_dir, "videos", f"{c}.timestamps.parquet")
+        if not os.path.exists(f):
+            raise FileNotFoundError(
+                "F1: real per-camera timestamps are required but were not found.\n"
+                f"  looked for {ct}\n  and for    {f}\n"
+                "Set data.pixel_source.camera_timestamp_source=lidar to deliberately reproduce "
+                "the superseded behaviour."
+            )
+        col = pd.read_parquet(f)["timestamp"].to_numpy().astype(np.int64)
+        idx = np.abs(col[None, :] - spin[:, None]).argmin(axis=1)
+        out[c] = col[idx]
+    return out
+
+
 # ===========================================================================
 # Pixel source
 # ===========================================================================
@@ -441,26 +508,52 @@ class NVIDIAAVFogPixelSource(ScenePixelSource):
             T_rig_from_cam = np.array(T_cam_rig_all[cam_name], dtype=np.float64)
             cam_to_egos.append(T_rig_from_cam)
 
+        # ------- F1: per-camera capture times -------
+        # `timesteps` stays an integer index (the split machinery keys on it), but
+        # `timestamps` -- which is what gets normalised and fed to the dynamic/flow
+        # branch -- is now the camera's OWN time, expressed in frame units so the scale
+        # is unchanged: (t_cam - spin_center[start]) / frame_period. Previously all seven
+        # cameras of a timestep shared one integer, i.e. the two trigger groups were
+        # modelled as simultaneous when they can be up to 29.77 ms apart.
+        self.camera_timestamps_us = load_camera_timestamps_us(
+            str(scene_path), self._cam_names,
+            source=str(getattr(self.data_cfg, "camera_timestamp_source", "auto")),
+        )
+        spin_us = load_spin_centers_us(str(scene_path))
+        self.spin_centers_us = spin_us
+        t0_us = float(spin_us[self.start_timestep])
+        period_us = float(np.median(np.diff(spin_us))) if len(spin_us) > 1 else 1e5
+        self.frame_period_us = period_us
+        self.t0_us = t0_us
+        offsets_ms = {
+            c: float(np.median(self.camera_timestamps_us[c] - spin_us)) / 1e3 for c in self._cam_names
+        }
+        logger.info(
+            "[NVIDIA_AV_Fog] per-camera offset from the LiDAR spin centre (ms): "
+            + ", ".join(f"{c.replace('camera_', '')} {v:+.2f}" for c, v in offsets_ms.items())
+            + f" | spread {max(offsets_ms.values()) - min(offsets_ms.values()):.2f} ms"
+        )
+
         # ------- per-frame ego_to_world (rebased to start) and cam_to_world -------
         ego_to_worlds, cam_to_worlds, intrinsics = [], [], []
         cam_ids, timestamps, timesteps = [], [], []
         for t in range(self.start_timestep, self.end_timestep):
             ego_to_world_t = inv_start @ ego_to_world_iso[t]
             ego_to_worlds.append(ego_to_world_t)
-            for slot_idx in range(len(self._cam_names)):
+            for slot_idx, cam_name in enumerate(self._cam_names):
                 cam_ids.append(self.camera_list[slot_idx])
                 c2w = ego_to_world_t @ cam_to_egos[slot_idx]
                 cam_to_worlds.append(c2w)
                 intrinsics.append(_intrinsics[slot_idx])
-                # timesteps + timestamps both integer-relative-to-start (matches PandaSet)
-                timestamps.append(t - self.start_timestep)
+                # integer index for bookkeeping, real (fractional) time for the model
+                timestamps.append((float(self.camera_timestamps_us[cam_name][t]) - t0_us) / period_us)
                 timesteps.append(t - self.start_timestep)
 
         self.intrinsics = torch.from_numpy(np.stack(intrinsics, axis=0)).float()
         self.cam_to_worlds = torch.from_numpy(np.stack(cam_to_worlds, axis=0)).float()
         self.ego_to_worlds = torch.from_numpy(np.stack(ego_to_worlds, axis=0)).float()
         self.cam_ids = torch.from_numpy(np.array(cam_ids, dtype=np.int64)).long()
-        self._timestamps = torch.from_numpy(np.array(timestamps, dtype=np.float32)).float()
+        self._timestamps = torch.from_numpy(np.array(timestamps, dtype=np.float64)).float()
         self._timesteps = torch.from_numpy(np.array(timesteps, dtype=np.int64)).long()
 
 
@@ -548,6 +641,12 @@ class NVIDIAAVFogLiDARSource:
             l2ws.append(self.inv_start @ ego_to_world_iso[t] @ self.lidar_to_ego)
         self.lidar_to_worlds = torch.from_numpy(np.stack(l2ws, axis=0)).float()
 
+        # Camera/LiDAR share one time origin and scale (see the pixel source).
+        spin_us = load_spin_centers_us(str(scene_path))
+        t0_us = float(spin_us[self.start_timestep])
+        period_us = float(np.median(np.diff(spin_us))) if len(spin_us) > 1 else 1e5
+        self.frame_times = (spin_us[self.start_timestep:self.end_timestep].astype(np.float64) - t0_us) / period_us
+
         # Also cache ego_to_world (canonical) so we can transform raw ego-frame points.
         e2ws = []
         for t in range(self.start_timestep, self.end_timestep):
@@ -615,7 +714,10 @@ class NVIDIAAVFogLiDARSource:
             accumulated_kept += n_kept
 
             timestep_idx = t_global - self.start_timestep
-            ts_t = torch.full((n_kept,), float(timestep_idx))
+            # Same clock as the cameras: frame units measured from spin_center[start].
+            # Identical to `timestep_idx` up to the (sub-microsecond) spin-period jitter,
+            # but it keeps the two modalities on one definition rather than two.
+            ts_t = torch.full((n_kept,), float(self.frame_times[timestep_idx]))
 
             origins.append(origin_t)
             directions.append(dirs)

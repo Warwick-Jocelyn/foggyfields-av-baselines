@@ -215,10 +215,10 @@ index 2643f0e..d51e438 100644
              data["azimuth_resolution"] = azimuth_resolution
 diff --git a/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
 new file mode 100644
-index 0000000..c08b813
+index 0000000..e59aa48
 --- /dev/null
 +++ b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
-@@ -0,0 +1,1465 @@
+@@ -0,0 +1,1478 @@
 +# Copyright 2024 the authors of NeuRAD and contributors.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -277,12 +277,15 @@ index 0000000..c08b813
 +NVIDIA_AV_FOG_LIDAR: str = "lidar_top_360fov"
 +
 +# The seven cameras are NOT exposed simultaneously. They split into two trigger groups
-+# with a large, systematic offset from the LiDAR spin centre (measured on the released
-+# clips, see DATASET_NOTES.md "F1"):
++# (see DATASET_NOTES.md "F1"):
 +#   group A: front_wide, rear_left, rear_right, front_tele
 +#   group B: cross_left, cross_right, rear_tele
-+# Intra-group jitter is +-0.1 ms; the inter-group gap reaches 16.9 ms (NFF-01), which is
-+# 15.5 cm of ego motion at 32.9 km/h. Never reuse the LiDAR timestamp for a camera.
++# Intra-group jitter is +-0.1 ms, so each group has one well-defined time. The offset
++# BETWEEN the groups is CLIP-SPECIFIC: over all 32 released clips it runs from 0.01 ms
++# (NCF-03, the groups coincide) to 29.77 ms (NCF-01), and its sign flips between clips.
++# There is no constant to hardcode and no typical value to assume -- the timestamps must
++# be read from each clip. Never reuse the LiDAR timestamp for a camera. The groups below
++# are used only to summarise the measured offsets in the parse log.
 +NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS: Tuple[Tuple[str, ...], Tuple[str, ...]] = (
 +    ("camera_front_wide_120fov", "camera_rear_left_70fov", "camera_rear_right_70fov", "camera_front_tele_30fov"),
 +    ("camera_cross_left_120fov", "camera_cross_right_120fov", "camera_rear_tele_30fov"),
@@ -555,9 +558,11 @@ index 0000000..c08b813
 +         spin centre by nearest neighbour (exactly the frame-selection rule the dataset
 +         converter used to pick the rectified frame).
 +    ``lidar`` reproduces the ORIGINAL, DEFECTIVE behaviour -- every camera inherits the
-+    LiDAR spin-centre timestamp. Keep it only to re-create pre-fix runs on purpose; it
-+    costs up to 16.9 ms of timing error (~15.5 cm of ego motion at 32.9 km/h) and it also
-+    corrupts dynamic-actor pose interpolation, which is done in time.
++    LiDAR spin-centre timestamp. Keep it only to re-create pre-fix runs on purpose. The
++    cost is clip-specific: per-camera offsets span -15.75 .. +16.06 ms across the 32
++    released clips, the two trigger groups are 0.01 .. 29.77 ms apart, and the worst
++    inter-group displacement is 65 cm of ego motion (NFF-14). It also corrupts
++    dynamic-actor pose interpolation, which is done in time.
 +    ``auto`` = ``per_camera`` if either source exists, else hard error (it never silently
 +    degrades to the LiDAR timestamp)."""
 +
@@ -591,8 +596,9 @@ index 0000000..c08b813
 +    resolution, sampled bilinearly) in place of the row-linear rolling-shutter formula.
 +    Rectification smears one v2 output row across a median of 104 source rows (max 178) of
 +    1080 on the 120 deg cameras = 2.93 ms (max 5.05), 35 px on the 70 deg, 7 px on the
-+    teles -- real, but smaller than F1's 16.9 ms. Silently inactive when the files are
-+    absent; they are being generated and exist in no clip yet."""
++    teles. Real, but typically smaller than F1 (per-camera offsets up to 16.06 ms,
++    trigger groups up to 29.77 ms apart), so F1 matters more. Silently inactive when the
++    files are absent -- they exist on 25 of 32 clips as of 2026-10-19."""
 +
 +    image_cache_warn_gb: float = 32.0
 +    """Log a warning when the projected image cache exceeds this. v2 is up to 2692x1880,
@@ -718,7 +724,8 @@ index 0000000..c08b813
 +            origin is passed in as an offset;
 +          * the measured spread is real but modest -- 2.7 ms median / 5.0 ms max on the
 +            120 deg cameras, 1.0 / 1.9 on the 70 deg, 0.17 / 0.41 on the teles -- i.e.
-+            well under F1's 16.9 ms. This is a refinement, not the main event.
++            generally under F1's per-camera offsets (up to 16.06 ms, and up to 29.77 ms
++            between the two trigger groups). This is a refinement, not the main event.
 +        """
 +        if not self.config.rs_time_offset_lookup:
 +            return
@@ -902,14 +909,17 @@ index 0000000..c08b813
 +
 +        F1. The original implementation gave every camera the LiDAR spin-centre
 +        timestamp. The cameras are in fact triggered in two groups (see
-+        ``NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS``) with a systematic offset from the spin
-+        centre. Measured medians (group A / group B):
++        ``NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS``) whose offsets from the spin centre are
++        clip-specific. Measured medians (group A / group B):
 +
-+            NFF-01  +2.74 / -14.17 ms      NCF-02  -4.71 / -15.75 ms
-+            NFF-07  +5.59 / -11.31 ms      NCF-08  -0.28 /  -2.31 ms
++            NFF-01  +2.74 / -14.17 ms      NCF-01  +14.33 / -15.44 ms  (gap 29.77 ms)
++            NFF-07  +5.59 / -11.31 ms      NCF-03  +16.05 / +16.06 ms  (gap  0.01 ms)
++            NFF-14 +10.27 /  -9.16 ms      NCF-08   -0.28 /  -2.31 ms  (gap  2.04 ms)
 +
-+        Worst inter-group gap 16.91 ms = 15.5 cm of ego motion at 32.9 km/h (~23 cm at
-+        49 km/h), and it propagates into dynamic-actor pose interpolation, which is
++        Across all 32 clips the per-camera offset spans -15.75 .. +16.06 ms and the
++        inter-group gap 0.01 .. 29.77 ms. Converted with each clip's own ego speed, the
++        worst inter-group displacement is 65 cm (NFF-14: 19.43 ms at 120 km/h) and 57 cm
++        on NFF-01; it also propagates into dynamic-actor pose interpolation, which is
 +        keyed on time.
 +        """
 +        cams = tuple(NVIDIA_AV_FOG_CAMERAS)
@@ -920,7 +930,9 @@ index 0000000..c08b813
 +            CONSOLE.print(
 +                "[bold red]NVIDIA_AV_FOG: camera_timestamp_source='lidar' -- every camera is being given the "
 +                "LiDAR spin-centre timestamp. This is the PRE-FIX (defective) behaviour and is only here to "
-+                "re-create superseded runs. Up to 16.9 ms / 15.5 cm of camera timing error.[/bold red]"
++                "re-create superseded runs. The real per-camera offsets reach 16 ms on this dataset "
++                "(up to 29.8 ms between the two trigger groups, 65 cm of ego motion at highway speed)."
++                "[/bold red]"
 +            )
 +            return {c: spin.copy() for c in cams}
 +
@@ -954,7 +966,7 @@ index 0000000..c08b813
 +                    f"  and for    {video_dir}/<cam>.timestamps.parquet\n"
 +                    "Re-run the dataset converter so one of them exists, or pass "
 +                    "`--camera-timestamp-source lidar` to deliberately reproduce the superseded, "
-+                    "defective behaviour (up to 16.9 ms of camera timing error)."
++                    "defective behaviour (per-camera timing error up to 16 ms on this dataset)."
 +                )
 +            for c, f in per_cam_files.items():
 +                col = pd.read_parquet(f)["timestamp"].to_numpy().astype(np.int64)
@@ -992,7 +1004,8 @@ index 0000000..c08b813
 +            gap = abs(float(np.median(ga)) - float(np.median(gb)))
 +            CONSOLE.log(
 +                f"  trigger-group gap: {gap:.2f} ms "
-+                f"(group A median {np.median(ga):+.2f}, group B median {np.median(gb):+.2f} ms)"
++                f"(group A median {np.median(ga):+.2f}, group B median {np.median(gb):+.2f} ms) "
++                f"-- clip-specific; 0.01-29.77 ms across the 32 released clips"
 +            )
 +
 +    def _apply_rolling_shutter_config(self) -> None:

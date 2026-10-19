@@ -18,6 +18,10 @@ data:
     # Rectification v1/v2. "auto" uses v2 (per-camera K at native angular resolution)
     # when the clip has it. apply_safe_crop crops away the black lens-cone border and
     # takes cx/cy from inside the safe_crop block. See RECTIFY_V2.md.
+    # F1: per-camera capture time. The 7 cameras fire in two groups whose offset is
+    # clip-specific (0.01 ms on NCF-03 .. 29.77 ms on NCF-01). "lidar" reinstates the
+    # superseded behaviour of one shared timestamp.
+    camera_timestamp_source: auto
     rectification: auto
     apply_safe_crop: true
     load_rgb: True

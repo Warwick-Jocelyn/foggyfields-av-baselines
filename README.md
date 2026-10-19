@@ -85,7 +85,7 @@ labelled; do not quote them.
 
 | | defect | measured magnitude |
 |---|---|---|
-| **F1** | every camera got the LiDAR spin-centre timestamp instead of its own | up to **16.91 ms** = **15.5 cm** of ego motion at 32.9 km/h (~23 cm at 49 km/h); also mistimed actor interpolation |
+| **F1** | every camera got the LiDAR spin-centre timestamp instead of its own | up to **16.06 ms** per camera and **29.77 ms** between the two trigger groups (clip-specific); worst measured ego displacement **65 cm** (NFF-14, 19.43 ms at 120 km/h); also mistimed actor interpolation |
 | **F2** | `rolling_shutter_time = 0` although `shutter_delay_us = 30559` is published | a 30.559 ms readout treated as global shutter |
 | **F3** | sensor-frame LiDAR transformed as if ego-frame | **1.94 m** vertical offset; world-frame ground at −1.94 m |
 | **F4** | class whitelist did not match the NCore vocabulary | `rider`, `animal`, `train_or_tram_car`, `stroller`, `protruding_object` silently dropped; NCF-08 alone loses 19,396 `person` boxes |
@@ -154,8 +154,9 @@ SplatAD/NeuRAD are unaffected and final.
   clip** — read `provenance.lidar_frame`; sensor-frame clips need `T_lidar_rig` applied
   first, and getting it wrong is a 1.94 m vertical error (F3). Column 4 is a **relative**
   offset (−50006…+50008 µs), whatever the dataset's CONVENTIONS.md says.
-- **Camera timestamps** are per camera, in two trigger groups up to 16.9 ms apart —
-  never reuse the LiDAR timestamp (F1).
+- **Camera timestamps** are per camera, in two trigger groups whose separation is
+  **clip-specific** (0.01 ms on NCF-03 … 29.77 ms on NCF-01, sign varies). Read each
+  clip's own file; never reuse the LiDAR timestamp and never assume a constant (F1).
 - **CUDA arch:** gsplat + tiny-cuda-nn JIT/compile against `TORCH_CUDA_ARCH_LIST`
   (hard-coded Blackwell `12.0` in the sbatch files). **Set it from `nvidia-smi
   --query-gpu=compute_cap` on the new GPU and force-rebuild** — see REPRODUCE §4.
