@@ -20,10 +20,10 @@ index f7459a1..eb27fc6 100644
  try:
 diff --git a/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
 new file mode 100644
-index 0000000..961f887
+index 0000000..28090e4
 --- /dev/null
 +++ b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
-@@ -0,0 +1,817 @@
+@@ -0,0 +1,935 @@
 +# Copyright 2024 the authors of NeuRAD and contributors.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -235,12 +235,32 @@ index 0000000..961f887
 +
 +    include_deformable_actors: bool = False
 +
-+    lidar_points_frame: Literal["ego", "sensor"] = "ego"
-+    """Frame of the xyz columns in ``lidar/sweep_*.npy``. The original code assumed "ego" and mapped the
-+    points into the lidar-sensor frame with inv(T_lidar_rig). On the packaged NFF release the sweeps are
-+    already in the SENSOR frame (ground plane sits at z≈-1.94 m = minus the lidar mount height; verified
-+    2026-10-12), so "sensor" (= use the points as-is) is the geometrically correct setting. Default stays
-+    "ego" to reproduce the published runs exactly."""
++    # ---- F3: LiDAR point frame ----------------------------------------------------
++    lidar_points_frame: Literal["auto", "ego", "sensor"] = "auto"
++    """Frame of the xyz columns in ``lidar/sweep_*.npy``.
++
++    ``auto`` (default) READS ``provenance.lidar_frame`` from the clip instead of trusting a
++    config default, because the answer differs per clip and is being changed in place:
++    the clear clips are already converted to true ego frame and marked ``"ego"``, the fog
++    clips are mid-conversion -- some marked ``"ego"``, the rest not marked at all and still
++    in the SENSOR frame.
++
++    Getting this wrong is a 1.94 m vertical error: the old default ``"ego"`` applied
++    inv(T_lidar_rig) to points that were already in the sensor frame, putting the
++    world-frame ground at -1.94 m instead of 0. That is what the published NeuRAD /
++    SplatAD numbers were trained on.
++
++    ``ego`` / ``sensor`` force the answer and override the marker (with a warning) -- use
++    them for clips that predate the marker."""
++
++    allow_unmarked_lidar_frame: bool = False
++    """Opt-in for clips with no ``provenance.lidar_frame``: treat them as legacy SENSOR
++    frame. Off by default so an unmarked clip can never be loaded on a guess; the error
++    names this flag."""
++
++    check_lidar_frame_geometry: bool = True
++    """Cross-check the declared frame against the measured ground plane of one sweep and
++    warn if the other hypothesis fits ~1.9 m better. Costs one ``np.load``."""
 +
 +    camera_timestamp_source: Literal["auto", "per_camera", "lidar"] = "auto"
 +    """Where the per-image capture time comes from.
@@ -278,6 +298,7 @@ index 0000000..961f887
 +    T_rig_world: np.ndarray = field(default_factory=lambda: np.zeros((0, 4, 4)))  # [T,4,4] p_world = T @ p_ego
 +    timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds (LiDAR spin centre)
 +    camera_timestamps_us: Dict[str, np.ndarray] = field(default_factory=dict)    # cam -> [T] microseconds
++    lidar_frame: str = "sensor"  # resolved from provenance.lidar_frame; see _resolve_lidar_frame()
 +    num_timesteps: int = 0
 +    # Per-camera/lidar metadata for split lookup:
 +    _cam_timestep: List[int] = field(default_factory=list)
@@ -324,6 +345,7 @@ index 0000000..961f887
 +        self.num_timesteps = T
 +        self.camera_timestamps_us = self._load_camera_timestamps()
 +        self._apply_rolling_shutter_config()
++        self.lidar_frame = self._resolve_lidar_frame()
 +        # If a fixed split file was requested, load timestep indices for it.
 +        self._train_timesteps, self._eval_timesteps = self._load_split_indices()
 +        outputs = super()._generate_dataparser_outputs(split)
@@ -506,6 +528,99 @@ index 0000000..961f887
 +            f"(0 = the image timestamp is assumed to be the CENTRE of the frame; see F2 in the PR)"
 +        )
 +
++    # ----- LiDAR frame --------------------------------------------------------------
++
++    def _resolve_lidar_frame(self) -> str:
++        """F3. Decide the frame of ``lidar/sweep_*.npy`` from the clip, not from a default.
++
++        ``provenance.json`` carries ``lidar_frame`` once the clip has been converted::
++
++            {"lidar_frame": "ego",
++             "lidar_frame_fix": {"ground_z_before_m": -1.96, "ground_z_after_m": 0.0, ...}}
++
++        Clips written before the fix have no marker and are in the SENSOR frame. Loading
++        one as "ego" applies inv(T_lidar_rig) a second time and drops the world-frame
++        ground to -1.94 m -- the error behind the superseded published numbers.
++        """
++        prov_path = self.clip_root / "provenance.json"
++        marker = None
++        if prov_path.exists():
++            try:
++                marker = json.loads(prov_path.read_text()).get("lidar_frame")
++            except json.JSONDecodeError as e:
++                raise ValueError(f"{prov_path} is not valid JSON: {e}") from e
++        if marker is not None and marker not in ("ego", "sensor"):
++            raise ValueError(
++                f"{prov_path}: lidar_frame={marker!r} is not one of 'ego' / 'sensor'. "
++                f"Refusing to guess the LiDAR frame."
++            )
++
++        forced = self.config.lidar_points_frame
++        if forced != "auto":
++            if marker is not None and marker != forced:
++                CONSOLE.print(
++                    f"[bold yellow]NVIDIA_AV_FOG: lidar_points_frame='{forced}' OVERRIDES "
++                    f"provenance.lidar_frame='{marker}'. If that is not deliberate you are introducing a "
++                    f"{abs(float(self.T_lidar_rig[2, 3])):.2f} m vertical error.[/bold yellow]"
++                )
++            else:
++                CONSOLE.log(f"NVIDIA_AV_FOG LiDAR frame: '{forced}' (forced by config)")
++            frame = forced
++        elif marker is not None:
++            CONSOLE.log(f"NVIDIA_AV_FOG LiDAR frame: '{marker}' (from provenance.lidar_frame)")
++            frame = marker
++        elif self.config.allow_unmarked_lidar_frame:
++            CONSOLE.print(
++                "[bold red]NVIDIA_AV_FOG: this clip has no provenance.lidar_frame. "
++                "allow_unmarked_lidar_frame=True -> assuming the LEGACY SENSOR frame. "
++                "Verify against the ground-plane check below before trusting any metric.[/bold red]"
++            )
++            frame = "sensor"
++        else:
++            raise ValueError(
++                f"{prov_path} has no 'lidar_frame' marker, so the frame of lidar/sweep_*.npy is unknown.\n"
++                f"  This clip predates the frame fix and is almost certainly in the SENSOR frame.\n"
++                f"  Pass `--allow-unmarked-lidar-frame True` to accept that reading, or\n"
++                f"  `--lidar-points-frame {{ego,sensor}}` to state it outright.\n"
++                f"  Guessing costs {abs(float(self.T_lidar_rig[2, 3])):.2f} m of vertical offset."
++            )
++
++        if self.config.check_lidar_frame_geometry:
++            self._check_lidar_frame_geometry(frame)
++        return frame
++
++    def _check_lidar_frame_geometry(self, frame: str) -> None:
++        """Warn if the measured ground plane disagrees with the declared frame.
++
++        Ground z is estimated as the 10th percentile of z over points 6-20 m out, which is
++        robust to the ego vehicle and to nearby traffic but NOT to a strong road gradient --
++        hence a warning, never an error.
++        """
++        sweep_path = self.clip_root / "lidar" / "sweep_0000.npy"
++        if not sweep_path.exists():
++            return
++        sweep = np.load(sweep_path)
++        radius = np.hypot(sweep[:, 0], sweep[:, 1])
++        sel = sweep[(radius > 6.0) & (radius < 20.0), 2]
++        if sel.size < 1000:
++            return
++        ground_z = float(np.percentile(sel, 10))
++        mount_z = float(self.T_lidar_rig[2, 3])
++        err_declared = abs(ground_z - (0.0 if frame == "ego" else -mount_z))
++        err_other = abs(ground_z - (-mount_z if frame == "ego" else 0.0))
++        CONSOLE.log(
++            f"NVIDIA_AV_FOG LiDAR frame check: ground z (p10, 6-20 m) = {ground_z:+.2f} m, "
++            f"lidar mount z = {mount_z:+.2f} m; expected ~"
++            f"{0.0 if frame == 'ego' else -mount_z:+.2f} m for frame='{frame}'"
++        )
++        if err_other + 1.0 < err_declared:
++            CONSOLE.print(
++                f"[bold red]NVIDIA_AV_FOG: the ground plane fits frame="
++                f"'{'sensor' if frame == 'ego' else 'ego'}' {err_declared - err_other:.2f} m better than the "
++                f"declared '{frame}'. Either provenance.lidar_frame is wrong or this clip is on a steep "
++                f"gradient. Check before trusting LiDAR metrics.[/bold red]"
++            )
++
 +    # ----- ADDataParser overrides -------------------------------------------------
 +
 +    def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
@@ -616,13 +731,16 @@ index 0000000..961f887
 +
 +    def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[torch.Tensor]:
 +        """Returns one [N, 5] tensor per lidar frame: x, y, z, intensity, t_offset (sec).
-+        Points are already in ego (== sensor==ego since lidar≈rig) frame on disk, so
-+        no world->sensor transform is needed — but we still apply T_lidar_rig to express
-+        them in the actual lidar-sensor frame the ADDataParser expects.
++
++        ADDataParser wants the points in the LIDAR SENSOR frame (``lidar_to_worlds``
++        already contains ``T_lidar_rig``). So:
++          * ``self.lidar_frame == "sensor"`` -> the points are already there, use as-is;
++          * ``self.lidar_frame == "ego"``    -> map ego -> sensor with inv(T_lidar_rig).
++        The frame comes from ``provenance.lidar_frame`` (F3), not from a config default.
 +        """
 +        # self.T_lidar_rig is T_rig_from_lidar (lidar->rig); invert to get rig->lidar so we can
 +        # transform sweep points from ego(=rig) frame into actual lidar-sensor frame.
-+        if self.config.lidar_points_frame == "sensor":
++        if self.lidar_frame == "sensor":
 +            Rrig = torch.eye(3); trig = torch.zeros(3)  # points already in the lidar-sensor frame
 +        else:
 +            T_lid_from_rig = torch.tensor(np.linalg.inv(self.T_lidar_rig), dtype=torch.float64)

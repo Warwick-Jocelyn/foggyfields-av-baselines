@@ -7,8 +7,10 @@ Reads the NVIDIA Physical AI AV clips in either of the two on-disk layouts
 
 Per-clip layout:
   images/<cam>/frame_NNNN.jpg              7 cams, NNNN in 0000..0198
-  lidar/sweep_NNNN.npy                      [N,6] float32, EGO frame
-                                            cols = [x, y, z, intensity, t_offset_us, ring_id]
+  lidar/sweep_NNNN.npy                      [N,6] float32, cols =
+                                            [x, y, z, intensity, t_offset_us, ring_id].
+                                            The xyz FRAME is per-clip: read
+                                            provenance.lidar_frame (see resolve_lidar_frame).
   calib/K_rectified.json                    per-cam intrinsics {fx, fy, cx, cy, w, h}
   calib/T_camera_rig.json                   per-cam 4x4 = p_cam = T @ p_ego  (cam_from_ego)
   calib/T_lidar_rig.json                    {"lidar_top_360fov": 4x4 = lidar_from_ego}
@@ -168,6 +170,51 @@ def _load_rig_world_poses(parquet_path: str) -> np.ndarray:
             col = f"T_rig_world_{r}{c}"
             poses[:, r, c] = df[col].to_numpy(dtype=np.float64)
     return poses
+
+
+def resolve_lidar_frame(clip_dir: str, forced: str = "auto",
+                       allow_unmarked: bool = False, mount_z: float = 1.94) -> str:
+    """F3. Frame of ``lidar/sweep_*.npy``, read from the clip rather than assumed.
+
+    ``provenance.json`` gains ``"lidar_frame": "ego"`` once a clip has been converted;
+    clips written before the fix carry no marker and are in the SENSOR frame.
+
+    The original EmerNeRF loader did ``xyz_world = xyz_ego @ R.T + tvec`` with no switch
+    at all, i.e. it treated every sweep as ego-frame. On the sensor-frame clips that is a
+    ``mount_z`` = 1.94 m vertical error in every LiDAR ray, and unlike the nerfstudio side
+    it could not even be configured out.
+    """
+    prov = os.path.join(clip_dir, "provenance.json")
+    marker = None
+    if os.path.exists(prov):
+        with open(prov) as f:
+            marker = json.load(f).get("lidar_frame")
+    if marker is not None and marker not in ("ego", "sensor"):
+        raise ValueError(f"{prov}: lidar_frame={marker!r} is neither 'ego' nor 'sensor'.")
+
+    if forced != "auto":
+        if marker is not None and marker != forced:
+            logger.warning(
+                f"[NVIDIA_AV_Fog-LiDAR] points_frame='{forced}' OVERRIDES provenance.lidar_frame="
+                f"'{marker}'; if unintended this is a {mount_z:.2f} m vertical error."
+            )
+        return forced
+    if marker is not None:
+        logger.info(f"[NVIDIA_AV_Fog-LiDAR] LiDAR frame '{marker}' (from provenance.lidar_frame)")
+        return marker
+    if allow_unmarked:
+        logger.warning(
+            "[NVIDIA_AV_Fog-LiDAR] no provenance.lidar_frame; allow_unmarked_lidar_frame=True "
+            "-> assuming the LEGACY SENSOR frame."
+        )
+        return "sensor"
+    raise ValueError(
+        f"{prov} has no 'lidar_frame' marker, so the frame of lidar/sweep_*.npy is unknown.\n"
+        f"  This clip predates the frame fix and is almost certainly in the SENSOR frame.\n"
+        f"  Set data.lidar_source.allow_unmarked_lidar_frame=true to accept that, or\n"
+        f"  data.lidar_source.points_frame=ego|sensor to state it outright.\n"
+        f"  Guessing costs {mount_z:.2f} m of vertical offset on every LiDAR ray."
+    )
 
 
 # ===========================================================================
@@ -399,6 +446,14 @@ class NVIDIAAVFogLiDARSource:
         T_rig_from_lidar = np.array(tl["lidar_top_360fov"], dtype=np.float64)
         self.lidar_to_ego = T_rig_from_lidar  # (4,4)
 
+        # F3: frame of the stored xyz, from provenance.json (not assumed).
+        self.points_frame = resolve_lidar_frame(
+            str(scene_path),
+            forced=str(getattr(self.data_cfg, "points_frame", "auto")),
+            allow_unmarked=bool(getattr(self.data_cfg, "allow_unmarked_lidar_frame", False)),
+            mount_z=abs(float(T_rig_from_lidar[2, 3])),
+        )
+
         ego_to_world_native = _load_rig_world_poses(
             str(scene_path / "calib" / "T_rig_world.parquet")
         )  # (T,4,4)
@@ -426,7 +481,14 @@ class NVIDIAAVFogLiDARSource:
             desc="Loading NVIDIA_AV_Fog LiDAR", dynamic_ncols=True,
         )):
             sweep = np.load(self.lidar_filepaths[i])  # (N, 6) float32
-            xyz_ego = sweep[:, :3].astype(np.float32)
+            xyz_raw = sweep[:, :3].astype(np.float32)
+            if self.points_frame == "sensor":
+                # lidar-sensor -> ego/rig. Without this the ground sits mount_z (1.94 m)
+                # too low in world coordinates. See resolve_lidar_frame().
+                L = self.lidar_to_ego.astype(np.float32)
+                xyz_ego = xyz_raw @ L[:3, :3].T + L[:3, 3][None, :]
+            else:
+                xyz_ego = xyz_raw
             intensity = sweep[:, 3].astype(np.float32)
             ring_id = sweep[:, 5].astype(np.int64)
 
@@ -483,6 +545,7 @@ class NVIDIAAVFogLiDARSource:
             f"[NVIDIA_AV_Fog-LiDAR] kept {accumulated_kept}/{accumulated} rays "
             f"({100.0*accumulated_kept/max(accumulated,1):.1f}%)"
         )
+        self._log_ground_plane_check()
         self.origins = torch.cat(origins, dim=0)
         self.directions = torch.cat(directions, dim=0)
         self.ranges = torch.cat(ranges, dim=0)
@@ -492,6 +555,32 @@ class NVIDIAAVFogLiDARSource:
         self._timesteps = torch.cat(timesteps, dim=0).long()
 
     # ------------------------------------------------------------------
+    def _log_ground_plane_check(self) -> None:
+        """Sanity block: ground z of the first sweep under the resolved frame.
+
+        p10 of z over points 6-20 m out. Expect ~0 m once the points are in the ego
+        frame; ~-mount_z means the sensor->ego step was skipped. A strong road gradient
+        can move this, so it is logged, not asserted.
+        """
+        try:
+            sweep = np.load(self.lidar_filepaths[0])
+        except Exception:  # pragma: no cover - diagnostics only
+            return
+        xyz = sweep[:, :3].astype(np.float32)
+        if self.points_frame == "sensor":
+            L = self.lidar_to_ego.astype(np.float32)
+            xyz = xyz @ L[:3, :3].T + L[:3, 3][None, :]
+        r = np.hypot(xyz[:, 0], xyz[:, 1])
+        sel = xyz[(r > 6.0) & (r < 20.0), 2]
+        if sel.size < 1000:
+            return
+        mount_z = abs(float(self.lidar_to_ego[2, 3]))
+        logger.info(
+            f"[NVIDIA_AV_Fog-LiDAR] frame='{self.points_frame}' ground z (p10, 6-20 m, ego) = "
+            f"{np.percentile(sel, 10):+.2f} m (expect ~0.00; ~{-mount_z:+.2f} would mean the "
+            f"sensor->ego step is missing)"
+        )
+
     def to(self, device):
         self.device = device
         for name in ("origins", "directions", "ranges",

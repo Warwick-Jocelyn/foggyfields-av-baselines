@@ -35,6 +35,11 @@ data:
     truncated_min_range: -2
     lidar_downsample_factor: 4
     lidar_percentile: 0.02
+    # F3: frame of lidar/sweep_*.npy. "auto" reads provenance.lidar_frame from the clip.
+    # Set to "sensor"/"ego" only to override the marker; allow_unmarked_lidar_frame
+    # opts in to treating an UNMARKED (pre-fix) clip as legacy sensor frame.
+    points_frame: auto
+    allow_unmarked_lidar_frame: false
   occ_source:
     voxel_size: 0.1
 
