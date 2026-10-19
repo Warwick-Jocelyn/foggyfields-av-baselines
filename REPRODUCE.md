@@ -5,10 +5,65 @@ Everything below assumes `bash`. Replace `$DATA_ROOT` / `$OUT` / arch with your 
 
 ```bash
 # pick your locations
-export DATA_ROOT=/path/to/NVIDIA_AV_Fog        # processed dataset root (has processed/<clip>/processed_pinhole)
-export OUT=/path/to/NVIDIA-Fog-Output          # where runs/renders/metrics go
-export PYTHONNOUSERSITE=1                       # ALWAYS — user-site pkgs shadow the env
+export DATA_ROOT=/path/to/physicalai_av/NVIDIA_FOGGY_Field   # subset root; holds clips/<ID>__<hash>/
+export OUT=/path/to/NVIDIA-Fog-Output                        # where runs/renders/metrics go
+export PYTHONNOUSERSITE=1                                    # ALWAYS — user-site pkgs shadow the env
 ```
+
+`DATA_ROOT` may be any of:
+
+* a subset root containing `clips/` (**the live layout**) — `NVIDIA_FOGGY_Field` or
+  `NVIDIA_CLEAR_Field`;
+* their shared parent, in which case both subsets are searched;
+* a legacy root containing `processed/<clip>/processed_pinhole/` (still supported).
+
+`--sequence` takes `NFF-01` / `NCF-08`, the hash (`b9ea7a9d`), the full directory name,
+or — legacy layout only — a 3-digit prefix such as `002`.
+
+Data sources (both **private**, request access):
+`JocelynW/NFF` (fog) and `JocelynW/NCF` (clear). The clip ids used here (`NFF-xx`,
+`NCF-xx`) are the ids in those repos.
+
+---
+
+## 0. ⚠️ Which regime are you reproducing?
+
+Six dataparser defects (F1–F6) were fixed on `fix/camera-timing-lidar-frame-v2`. Every
+number in `RESULTS.md` and `results/metrics/**` predates that and is **superseded** —
+chiefly by **F1** (up to 16.91 ms of camera timing error = 15.5 cm of ego motion at
+32.9 km/h) and **F3** (a 1.94 m vertical LiDAR offset). Full detail in `DATASET_NOTES.md`.
+
+The corrected behaviour is the **default**: `ns-train ... nvidia-av-fog-data --sequence
+NFF-01` with no further flags already does the right thing. The old behaviour is
+reproducible, but only on purpose:
+
+```bash
+source jobs/regimes.sh
+
+set_regime v2fixed          # corrected defaults; writes to  <OUT>/v2fixed/<SEQ>
+set_regime legacy_prefix    # SUPERSEDED pre-fix behaviour;  <OUT>/legacy_prefix_SUPERSEDED/<SEQ>
+
+ns-train neurad-paper --output-dir "$OUT/$REGIME_DIR/$SEQ" \
+    nvidia-av-fog-data --sequence "$SEQ" --train-split-fraction 0.5 "${DP_FLAGS[@]}"
+```
+
+The regime name is in the flags *and* in the output directory, so a run can never be
+misattributed afterwards. Do not report `legacy_prefix` numbers as results.
+
+### Memory, for rectification v2
+
+v2 is up to 2692×1880 — 4.1× v1's pixels — and nerfstudio caches every training image.
+The dataparser logs the projected cache at startup (NCF-08, all 7 cameras, all 199
+timesteps: **44.3 GB** as float32, **11.1 GB** as uint8; roughly half that per split)
+and warns past `--image-cache-warn-gb`. If it is too big:
+
+```bash
+--pipeline.datamanager.cache-images-type uint8        # 4x less than float32
+--pipeline.datamanager.cache-images cpu               # keep it off the GPU
+--pipeline.datamanager.camera-res-scale-factor 0.5    # 4x less again
+```
+
+Or stay on v1 with `--rectification v1`.
 
 ---
 

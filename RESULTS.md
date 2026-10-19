@@ -1,5 +1,30 @@
 # RESULTS — reproduction report
 
+> # ⚠️ EVERY NUMBER IN THIS FILE IS SUPERSEDED
+>
+> All NeuRAD, SplatAD and EmerNeRF numbers below were produced with two verified
+> dataparser defects present. They are kept, unchanged, as a record of what the
+> pre-fix pipeline produced — **do not quote them as results** and do not compare
+> them against anything trained after branch `fix/camera-timing-lidar-frame-v2`.
+>
+> | | defect | measured magnitude |
+> |---|---|---|
+> | **F1** | every camera was given the LiDAR spin-centre timestamp instead of its own | up to **16.91 ms** of camera timing error = **15.5 cm** of ego motion at 32.9 km/h (~23 cm at 49 km/h); also mistimed dynamic-actor interpolation |
+> | **F3** | sensor-frame LiDAR points were transformed as if they were ego-frame | **1.94 m** vertical offset — the world-frame ground sat at −1.94 m instead of 0 |
+>
+> F1 affects RGB and LiDAR equally (the cameras are posed at the wrong instant).
+> F3 affects every LiDAR metric in §1 and §2 and the geometry the RGB branch is
+> supervised against. Four further defects (F2 rolling shutter, F4 class vocabulary,
+> F5 `stationary`, F6 LiDAR beam model / ray-drop) are smaller but also present.
+> See `DATASET_NOTES.md` for all six, and the PR body for the full write-up.
+>
+> **Re-running these.** The corrected regime is the dataparser's default; the old
+> behaviour is reproducible on purpose via `jobs/regimes.sh` (`set_regime
+> legacy_prefix`), which writes to a `legacy_prefix_SUPERSEDED/` output directory so
+> the two regimes cannot be confused later. New runs go under `v2fixed/`.
+>
+> Nothing in `results/metrics/**` has been deleted.
+
 Protocol everywhere: **nvs_50_50** (50% train / 50% held-out novel-view eval; same odd
 frames held out for all three methods after the EmerNeRF split fix).
 Hardware: 1× NVIDIA RTX PRO 6000 Blackwell (sm_120) per run.
