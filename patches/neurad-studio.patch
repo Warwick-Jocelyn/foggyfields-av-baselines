@@ -20,10 +20,10 @@ index f7459a1..eb27fc6 100644
  try:
 diff --git a/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
 new file mode 100644
-index 0000000..e9426d6
+index 0000000..961f887
 --- /dev/null
 +++ b/nerfstudio/data/dataparsers/nvidia_av_fog_dataparser.py
-@@ -0,0 +1,731 @@
+@@ -0,0 +1,817 @@
 +# Copyright 2024 the authors of NeuRAD and contributors.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -185,13 +185,41 @@ index 0000000..e9426d6
 +    min_lidar_dist: Tuple[float, float, float] = (1.0, 2.0, 2.0)
 +    """Drop points closer than this (sensor frame). Conservative defaults for ego."""
 +
-+    # NCore ftheta -> pinhole rectification is per-frame near-instantaneous from the
-+    # dataset's perspective (we already have pinhole frames on disk). The rolling-shutter
-+    # time and time-to-center-pixel for the source ftheta cameras are not published; we
-+    # leave them at zero (treat as global-shutter). This is consistent with how the
-+    # rectified pinhole frames are produced.
++    # ---- F2: rolling shutter ------------------------------------------------------
++    rolling_shutter_source: Literal["calib", "config"] = "calib"
++    """``calib`` (default) reads the PUBLISHED rolling-shutter readout time from
++    ``calib/camera_intrinsics_ftheta.json``: every camera of every clip, fog and clear,
++    carries ``"shutter_type": "ROLLING_TOP_TO_BOTTOM"`` and ``"shutter_delay_us": 30559``
++    (checked: 224/224 camera-clip entries). That is 30.559 ms of readout inside a 33.331 ms
++    frame period -- the frame is very nearly always mid-readout.
++
++    The original config set ``rolling_shutter_time = 0.0`` with a comment claiming the
++    value was "not published". It is published; the comment was wrong.
++
++    ``config`` uses ``rolling_shutter_time`` below verbatim; set both to reproduce the
++    superseded global-shutter runs (``--rolling-shutter-source config
++    --rolling-shutter-time 0.0``)."""
++
 +    rolling_shutter_time: float = 0.0
++    """Only consulted when ``rolling_shutter_source == "config"``. With ``calib`` this
++    field is overwritten at parse time by the published value (0.030559 s)."""
++
 +    time_to_center_pixel: float = 0.0
++    """Offset from the stored image timestamp to the time the CENTRE row is read out.
++
++    DELIBERATELY LEFT AT 0, AND THIS IS AN OPEN QUESTION -- see the PR body.
++    nerfstudio's ray generator computes
++        time_offset(row) = (row / height - 0.5) * rolling_shutter_time + time_to_center_pixel
++    so a non-zero value is needed exactly when the dataset's ``timestamp`` column means
++    the START of the frame rather than its CENTRE. We could not establish which it is:
++    the dataset documents neither, and NVIDIA's DriveWorks image-timestamp struct carries
++    BOTH a start-of-frame field and a frame-midpoint field, so which one the NCore export
++    wrote is a converter detail that is not visible from the released files.
++
++    If you establish that ``timestamp`` is start-of-frame, set this to
++    ``shutter_delay_us / 2 * 1e-6 = 0.0152795``. Leaving it at 0 is the correct choice
++    under the centre-of-frame reading and is a half-readout (15.3 ms) error under the
++    other -- which would be comparable to F1, so it is worth resolving."""
 +
 +    apply_iso_8855_rotation: bool = False
 +    """If True, apply ``R_iso_from_ncore`` to all world-frame poses (cam, lidar, cuboid).
@@ -295,6 +323,7 @@ index 0000000..e9426d6
 +        self.timestamps_us = pose_df["timestamp_us"].to_numpy().astype(np.int64)
 +        self.num_timesteps = T
 +        self.camera_timestamps_us = self._load_camera_timestamps()
++        self._apply_rolling_shutter_config()
 +        # If a fixed split file was requested, load timestep indices for it.
 +        self._train_timesteps, self._eval_timesteps = self._load_split_indices()
 +        outputs = super()._generate_dataparser_outputs(split)
@@ -419,6 +448,63 @@ index 0000000..e9426d6
 +                f"  trigger-group gap: {gap:.2f} ms "
 +                f"(group A median {np.median(ga):+.2f}, group B median {np.median(gb):+.2f} ms)"
 +            )
++
++    def _apply_rolling_shutter_config(self) -> None:
++        """F2. Take the rolling-shutter readout time from the published calibration.
++
++        ``calib/camera_intrinsics_ftheta.json`` carries, per camera::
++
++            "shutter_type":    "ROLLING_TOP_TO_BOTTOM"
++            "shutter_delay_us": 30559
++
++        nerfstudio applies ``rolling_shutter_time`` to every camera uniformly, so we
++        require the seven cameras to agree (they do, in all 32 clips) rather than
++        silently averaging them.
++        """
++        if self.config.rolling_shutter_source == "config":
++            CONSOLE.print(
++                f"[bold yellow]NVIDIA_AV_FOG: rolling_shutter_source='config' -> "
++                f"rolling_shutter_time={self.config.rolling_shutter_time} s is being used verbatim and the "
++                f"published 0.030559 s readout is ignored.[/bold yellow]"
++            )
++            return
++
++        path = self.clip_root / "calib" / "camera_intrinsics_ftheta.json"
++        if not path.exists():
++            raise FileNotFoundError(
++                f"rolling_shutter_source='calib' but {path} is missing. Pass "
++                f"`--rolling-shutter-source config --rolling-shutter-time 0.0` to deliberately "
++                f"treat the cameras as global-shutter (the superseded behaviour)."
++            )
++        ftheta = json.loads(path.read_text())
++        delays, types = {}, {}
++        for cam in NVIDIA_AV_FOG_CAMERAS:
++            if cam not in ftheta:
++                raise ValueError(f"{path} has no entry for {cam}")
++            delays[cam] = float(ftheta[cam]["shutter_delay_us"]) * 1e-6
++            types[cam] = str(ftheta[cam].get("shutter_type", "UNKNOWN"))
++
++        bad = {c: t for c, t in types.items() if t != "ROLLING_TOP_TO_BOTTOM"}
++        if bad:
++            raise ValueError(
++                f"Expected every camera to report shutter_type='ROLLING_TOP_TO_BOTTOM' "
++                f"(nerfstudio's TOP_TO_BOTTOM ray-time branch assumes it); got {bad}."
++            )
++        unique = sorted(set(round(v, 9) for v in delays.values()))
++        if len(unique) != 1:
++            raise ValueError(
++                f"Cameras disagree on shutter_delay_us ({delays}). nerfstudio applies one "
++                f"rolling_shutter_time to all cameras, so this needs a per-camera implementation "
++                f"rather than a silent average."
++            )
++        self.config.rolling_shutter_time = unique[0]
++        frame_period = 1.0 / 30.0
++        CONSOLE.log(
++            f"NVIDIA_AV_FOG rolling shutter: TOP_TO_BOTTOM, readout {unique[0] * 1e3:.3f} ms "
++            f"({100.0 * unique[0] / frame_period:.1f}% of the 33.3 ms frame period); "
++            f"time_to_center_pixel = {self.config.time_to_center_pixel} s "
++            f"(0 = the image timestamp is assumed to be the CENTRE of the frame; see F2 in the PR)"
++        )
 +
 +    # ----- ADDataParser overrides -------------------------------------------------
 +
