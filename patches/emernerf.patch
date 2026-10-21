@@ -1,9 +1,9 @@
 diff --git a/configs/nvidia_av_fog.yaml b/configs/nvidia_av_fog.yaml
 new file mode 100644
-index 0000000..acdb307
+index 0000000..d80d899
 --- /dev/null
 +++ b/configs/nvidia_av_fog.yaml
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,65 @@
 +# NVIDIA_AV_Fog config — RGB-only EmerNeRF (matches pandaset.yaml shape)
 +# Inherits structure from default_config.yaml; only the keys we override are listed here.
 +
@@ -21,6 +21,15 @@ index 0000000..acdb307
 +    downscale: 1
 +    num_cams: 7                     # rear_left, FL, F, FR, rear_right, front_tele, rear_tele
 +    test_image_stride: 2            # NVS-50/50 style (every other frame to val)
++    # Rectification v1/v2. "auto" uses v2 (per-camera K at native angular resolution)
++    # when the clip has it. apply_safe_crop crops away the black lens-cone border and
++    # takes cx/cy from inside the safe_crop block. See RECTIFY_V2.md.
++    # F1: per-camera capture time. The 7 cameras fire in two groups whose offset is
++    # clip-specific (0.01 ms on NCF-03 .. 29.77 ms on NCF-01). "lidar" reinstates the
++    # superseded behaviour of one shared timestamp.
++    camera_timestamp_source: auto
++    rectification: auto
++    apply_safe_crop: true
 +    load_rgb: True
 +    load_sky_mask: False            # masks/<cam>/valid_mask.png is rectification validity, not sky
 +    load_dynamic_mask: False
@@ -41,6 +50,11 @@ index 0000000..acdb307
 +    truncated_min_range: -2
 +    lidar_downsample_factor: 4
 +    lidar_percentile: 0.02
++    # F3: frame of lidar/sweep_*.npy. "auto" reads provenance.lidar_frame from the clip.
++    # Set to "sensor"/"ego" only to override the marker; allow_unmarked_lidar_frame
++    # opts in to treating an UNMARKED (pre-fix) clip as legacy sensor frame.
++    points_frame: auto
++    allow_unmarked_lidar_frame: false
 +  occ_source:
 +    voxel_size: 0.1
 +
@@ -57,10 +71,10 @@ index 0000000..acdb307
 +  remove_ground_when_eval_lidar_flow: True
 diff --git a/configs/nvidia_av_fog_lidar.yaml b/configs/nvidia_av_fog_lidar.yaml
 new file mode 100644
-index 0000000..bd0e8b3
+index 0000000..008b257
 --- /dev/null
 +++ b/configs/nvidia_av_fog_lidar.yaml
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,64 @@
 +# NVIDIA_AV_Fog config — RGB + LiDAR depth supervision (paper-default EmerNeRF)
 +# Inherits structure from default_config.yaml.
 +
@@ -77,6 +91,15 @@ index 0000000..bd0e8b3
 +    downscale: 1
 +    num_cams: 7
 +    test_image_stride: 2
++    # Rectification v1/v2. "auto" uses v2 (per-camera K at native angular resolution)
++    # when the clip has it. apply_safe_crop crops away the black lens-cone border and
++    # takes cx/cy from inside the safe_crop block. See RECTIFY_V2.md.
++    # F1: per-camera capture time. The 7 cameras fire in two groups whose offset is
++    # clip-specific (0.01 ms on NCF-03 .. 29.77 ms on NCF-01). "lidar" reinstates the
++    # superseded behaviour of one shared timestamp.
++    camera_timestamp_source: auto
++    rectification: auto
++    apply_safe_crop: true
 +    load_rgb: True
 +    load_sky_mask: False
 +    load_dynamic_mask: False
@@ -97,6 +120,11 @@ index 0000000..bd0e8b3
 +    truncated_min_range: -2
 +    lidar_downsample_factor: 4
 +    lidar_percentile: 0.02
++    # F3: frame of lidar/sweep_*.npy. "auto" reads provenance.lidar_frame from the clip.
++    # Set to "sensor"/"ego" only to override the marker; allow_unmarked_lidar_frame
++    # opts in to treating an UNMARKED (pre-fix) clip as legacy sensor frame.
++    points_frame: auto
++    allow_unmarked_lidar_frame: false
 +  occ_source:
 +    voxel_size: 0.1
 +
@@ -349,33 +377,38 @@ index 0000000..067fd61
 +print("================================")
 diff --git a/datasets/nvidia_av_fog.py b/datasets/nvidia_av_fog.py
 new file mode 100644
-index 0000000..ac5e20a
+index 0000000..0cd9c1c
 --- /dev/null
 +++ b/datasets/nvidia_av_fog.py
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,1112 @@
 +"""NVIDIA_AV_Fog dataparser for EmerNeRF.
 +
-+Reads the user's NVIDIA Physical AI AV fog clips at
-+  /networkhome/WMGDS/wang3_y/ETH/Dataset/NVIDIA_AV_Fog/processed/<clip>/processed_pinhole/
++Reads the NVIDIA Physical AI AV clips in either of the two on-disk layouts
++(see ``_resolve_clip_dir``):
++  <data_root>/clips/NFF-01__b9ea7a9d/                                  live
++  <data_root>/processed/<clip>/processed_pinhole/                      legacy
 +
-+Per-clip layout (processed_pinhole/):
++Per-clip layout:
 +  images/<cam>/frame_NNNN.jpg              7 cams, NNNN in 0000..0198
-+  lidar/sweep_NNNN.npy                      [N,6] float32, EGO frame
-+                                            cols = [x, y, z, intensity, t_offset_us, ring_id]
++  lidar/sweep_NNNN.npy                      [N,6] float32, cols =
++                                            [x, y, z, intensity, t_offset_us, ring_id].
++                                            The xyz FRAME is per-clip: read
++                                            provenance.lidar_frame (see resolve_lidar_frame).
 +  calib/K_rectified.json                    per-cam intrinsics {fx, fy, cx, cy, w, h}
 +  calib/T_camera_rig.json                   per-cam 4x4 = p_cam = T @ p_ego  (cam_from_ego)
 +  calib/T_lidar_rig.json                    {"lidar_top_360fov": 4x4 = lidar_from_ego}
 +  calib/T_rig_world.parquet                 per-frame ego->world (3x4, 199 rows)
++  calib/camera_timestamps.parquet           per-camera capture time (F1); the 7 cameras
++                                            are NOT simultaneous -- see
++                                            load_camera_timestamps_us()
 +  splits/{nvs_50_50,nvs_80_20,nvs_90_10,reconstruction_all}.json
 +  timestamps.txt                            one int per line (spin_center_us per timestep)
 +
 +Coordinate convention:
 +  Source dataset frames (NCore native): +x left, +y forward, +z up.
 +  EmerNeRF AD convention:               +x forward, +y left, +z up.
-+  We apply ISO 8855 rotation R = [[0,1,0],[1,0,0],[0,0,1]] to all WORLD-frame poses
-+  (so the canonical "world" is the start-of-clip ego frame, ISO-aligned). LiDAR
-+  points are loaded in ego frame and transformed through the same ISO-rotated
-+  lidar_to_world transform, so all modalities live in the same world frame.
++  No remap is applied: the released frames are already ISO 8855. The canonical
++  "world" is simply the start-of-clip ego frame.
 +
 +Heterogeneous camera resolutions:
 +  Three different native sizes (1280x960, 1120x800, 480x320). EmerNeRF's base
@@ -432,7 +465,9 @@ index 0000000..ac5e20a
 +    "camera_rear_tele_30fov",     # 6: rear-tele
 +]
 +
-+# Per-camera native resolution (h, w). Index matches NVIDIA_AV_FOG_CAMERAS_ALL.
++# v1 per-camera rectified resolution (h, w). Kept for reference only -- the real source
++# size now comes from the selected K (see resolve_rectification), because v2 is per-camera
++# and the safe crop changes it again.
 +NATIVE_HW: Dict[str, Tuple[int, int]] = {
 +    "camera_front_wide_120fov":   (960, 1280),
 +    "camera_cross_left_120fov":   (960, 1280),
@@ -443,36 +478,66 @@ index 0000000..ac5e20a
 +    "camera_rear_tele_30fov":     (320,  480),
 +}
 +
-+# ISO 8855 axis remap: NCore (+x left, +y fwd, +z up) → AD (+x fwd, +y left, +z up).
-+# This is a permutation matrix (swap x and y) — its own inverse.
-+ISO_8855_R = np.array([[0.0, 1.0, 0.0],
-+                       [1.0, 0.0, 0.0],
-+                       [0.0, 0.0, 1.0]], dtype=np.float64)
-+ISO_8855_T4 = np.eye(4, dtype=np.float64)
-+ISO_8855_T4[:3, :3] = ISO_8855_R
++# NOTE: an "ISO 8855 axis remap" [[0,1,0],[1,0,0],[0,0,1]] used to be defined here.
++# Its determinant is -1 -- it is a REFLECTION, not a rotation, and applying it mirrored
++# the scene (which is why it was disabled). The released data is already ISO 8855
++# (+x forward, +y left, +z up), so no remap is needed; the matrix is deleted rather than
++# left available to switch on.
 +
 +
 +def _resolve_clip_dir(data_root: str, scene_idx) -> str:
-+    """Resolve <data_root>/processed/<NNN>_*_/processed_pinhole by clip-prefix match.
++    """Resolve a clip directory, supporting both on-disk layouts.
 +
-+    scene_idx may be an int (002) or a str ("002") — both work.
++    Live layout::
++
++        <data_root>/clips/NFF-01__b9ea7a9d/
++        <data_root>/NVIDIA_FOGGY_Field/clips/NFF-01__b9ea7a9d/     (parent root)
++
++    Legacy layout (what the published runs used)::
++
++        <data_root>/processed/002_<uuid>_fog_day_rural/processed_pinhole/
++
++    ``scene_idx`` matches the exact directory name, the clip id before ``__``
++    (``NFF-01``), the hash after it, or -- legacy only -- a 3-digit prefix (``002``).
 +    """
-+    if isinstance(scene_idx, int):
-+        prefix = f"{scene_idx:03d}"
-+    else:
-+        prefix = str(scene_idx).zfill(3)
-+    processed_root = os.path.join(data_root, "processed")
-+    matches = sorted(glob(os.path.join(processed_root, f"{prefix}_*")))
-+    # filter to directories (skip *.md, *.log siblings)
-+    matches = [m for m in matches if os.path.isdir(m)]
-+    if not matches:
-+        raise FileNotFoundError(
-+            f"No clip dir found at {processed_root}/{prefix}_*"
-+        )
++    sel = f"{scene_idx:03d}" if isinstance(scene_idx, int) else str(scene_idx)
++
++    roots = []
++    if os.path.isdir(os.path.join(data_root, "clips")):
++        roots.append(os.path.join(data_root, "clips"))
++    for subset in ("NVIDIA_FOGGY_Field", "NVIDIA_CLEAR_Field"):
++        cand = os.path.join(data_root, subset, "clips")
++        if os.path.isdir(cand):
++            roots.append(cand)
++
++    matches = []
++    for root in roots:
++        for name in sorted(os.listdir(root)):
++            full = os.path.join(root, name)
++            if not os.path.isdir(full):
++                continue
++            clip_id, _, clip_hash = name.partition("__")
++            if sel in (name, clip_id, clip_hash) or clip_id.lower() == sel.lower():
++                matches.append(full)
++    if len(matches) == 1:
++        return matches[0]
 +    if len(matches) > 1:
-+        logger.warning(f"Multiple clip dirs match prefix {prefix}: {matches}; using {matches[0]}")
-+    clip_dir = matches[0]
-+    pin = os.path.join(clip_dir, "processed_pinhole")
++        raise ValueError(f"scene_idx {sel!r} matches multiple clips: {matches}")
++
++    # ---- legacy layout ----
++    processed_root = os.path.join(data_root, "processed")
++    if not os.path.isdir(processed_root):
++        raise FileNotFoundError(
++            f"{data_root} has neither clips/ (live layout) nor processed/ (legacy layout); "
++            f"scene_idx={sel!r}"
++        )
++    prefix = sel.zfill(3)
++    legacy = [m for m in sorted(glob(os.path.join(processed_root, f"{prefix}_*"))) if os.path.isdir(m)]
++    if not legacy:
++        raise FileNotFoundError(f"No clip dir found at {processed_root}/{prefix}_*")
++    if len(legacy) > 1:
++        logger.warning(f"Multiple clip dirs match prefix {prefix}: {legacy}; using {legacy[0]}")
++    pin = os.path.join(legacy[0], "processed_pinhole")
 +    if not os.path.isdir(pin):
 +        raise FileNotFoundError(f"{pin} does not exist (clip {prefix})")
 +    return pin
@@ -489,6 +554,164 @@ index 0000000..ac5e20a
 +            col = f"T_rig_world_{r}{c}"
 +            poses[:, r, c] = df[col].to_numpy(dtype=np.float64)
 +    return poses
++
++
++def resolve_lidar_frame(clip_dir: str, forced: str = "auto",
++                       allow_unmarked: bool = False, mount_z: float = 1.94) -> str:
++    """F3. Frame of ``lidar/sweep_*.npy``, read from the clip rather than assumed.
++
++    ``provenance.json`` gains ``"lidar_frame": "ego"`` once a clip has been converted;
++    clips written before the fix carry no marker and are in the SENSOR frame.
++
++    The original EmerNeRF loader did ``xyz_world = xyz_ego @ R.T + tvec`` with no switch
++    at all, i.e. it treated every sweep as ego-frame. On the sensor-frame clips that is a
++    ``mount_z`` = 1.94 m vertical error in every LiDAR ray, and unlike the nerfstudio side
++    it could not even be configured out.
++    """
++    prov = os.path.join(clip_dir, "provenance.json")
++    marker = None
++    if os.path.exists(prov):
++        with open(prov) as f:
++            marker = json.load(f).get("lidar_frame")
++    if marker is not None and marker not in ("ego", "sensor"):
++        raise ValueError(f"{prov}: lidar_frame={marker!r} is neither 'ego' nor 'sensor'.")
++
++    if forced != "auto":
++        if marker is not None and marker != forced:
++            logger.warning(
++                f"[NVIDIA_AV_Fog-LiDAR] points_frame='{forced}' OVERRIDES provenance.lidar_frame="
++                f"'{marker}'; if unintended this is a {mount_z:.2f} m vertical error."
++            )
++        return forced
++    if marker is not None:
++        logger.info(f"[NVIDIA_AV_Fog-LiDAR] LiDAR frame '{marker}' (from provenance.lidar_frame)")
++        return marker
++    if allow_unmarked:
++        logger.warning(
++            "[NVIDIA_AV_Fog-LiDAR] no provenance.lidar_frame; allow_unmarked_lidar_frame=True "
++            "-> assuming the LEGACY SENSOR frame."
++        )
++        return "sensor"
++    raise ValueError(
++        f"{prov} has no 'lidar_frame' marker, so the frame of lidar/sweep_*.npy is unknown.\n"
++        f"  This clip predates the frame fix and is almost certainly in the SENSOR frame.\n"
++        f"  Set data.lidar_source.allow_unmarked_lidar_frame=true to accept that, or\n"
++        f"  data.lidar_source.points_frame=ego|sensor to state it outright.\n"
++        f"  Guessing costs {mount_z:.2f} m of vertical offset on every LiDAR ray."
++    )
++
++
++def resolve_rectification(clip_dir: str, want: str = "auto", apply_safe_crop: bool = True):
++    """Pick the rectification version and return (version, dirs, K, crops).
++
++    v1 rectified all seven cameras onto ONE virtual pinhole (fx=fy=640, 1280x960), which
++    cost the 30 deg teles 5.8x of angular resolution. v2 gives each camera its own K at
++    its native angular resolution (``calib/K_rectified_v2.json``, ``images_rectv2/``).
++
++    v2's canvas still has black at the lens-cone boundary, so each entry carries a
++    ``safe_crop`` -- the largest rectangle with zero invalid pixels. Crop to it and take
++    cx/cy from INSIDE that block; fx/fy are unchanged by the crop. Reading the top-level
++    w/h instead is the specific mistake this exists to prevent.
++
++    Returns
++    -------
++    version   "v1" | "v2"
++    images_dirname, labels_2d_dirname
++    K         {cam: {fx, fy, cx, cy, w, h}}   (already crop-adjusted)
++    crops     {cam: (x, y, w, h)}             in canvas pixels
++    """
++    k2 = os.path.join(clip_dir, "calib", "K_rectified_v2.json")
++    has_v2 = os.path.exists(k2) and os.path.isdir(os.path.join(clip_dir, "images_rectv2"))
++    if want == "v2" and not has_v2:
++        raise FileNotFoundError(
++            f"rectification='v2' but {clip_dir} has no v2 data. Only some clips have been "
++            f"re-rectified; use 'auto' or 'v1'."
++        )
++    use_v2 = has_v2 if want == "auto" else (want == "v2")
++    if use_v2:
++        version, images_dirname, labels_2d = "v2", "images_rectv2", "labels_rectv2"
++        raw = json.load(open(k2))
++    else:
++        version, images_dirname, labels_2d = "v1", "images", "labels"
++        raw = json.load(open(os.path.join(clip_dir, "calib", "K_rectified.json")))
++
++    K, crops = {}, {}
++    for cam, k in raw.items():
++        entry = {"fx": float(k["fx"]), "fy": float(k["fy"]), "cx": float(k["cx"]),
++                 "cy": float(k["cy"]), "w": int(k["w"]), "h": int(k["h"])}
++        crop = (0, 0, int(k["w"]), int(k["h"]))
++        if version == "v2" and apply_safe_crop:
++            sc = k.get("safe_crop")
++            if sc is None:
++                raise ValueError(f"{k2}: no safe_crop block for {cam}; set apply_safe_crop=false.")
++            entry.update(cx=float(sc["cx"]), cy=float(sc["cy"]), w=int(sc["w"]), h=int(sc["h"]))
++            crop = (int(sc["x"]), int(sc["y"]), int(sc["w"]), int(sc["h"]))
++        K[cam], crops[cam] = entry, crop
++    return version, images_dirname, labels_2d, K, crops
++
++
++def load_spin_centers_us(clip_dir: str) -> np.ndarray:
++    """LiDAR spin-centre timestamp per timestep, microseconds."""
++    lt = os.path.join(clip_dir, "calib", "lidar_timestamps.parquet")
++    if os.path.exists(lt):
++        df = pd.read_parquet(lt)
++        if "spin_center_us" in df.columns:
++            sort_col = "sweep_idx" if "sweep_idx" in df.columns else df.columns[0]
++            return df.sort_values(sort_col)["spin_center_us"].to_numpy().astype(np.int64)
++    df = pd.read_parquet(os.path.join(clip_dir, "calib", "T_rig_world.parquet"))
++    return df.sort_values("timestep_idx")["timestamp_us"].to_numpy().astype(np.int64)
++
++
++def load_camera_timestamps_us(clip_dir: str, cam_names, source: str = "auto") -> Dict[str, np.ndarray]:
++    """F1. Per-camera capture timestamps in microseconds, one [T] array per camera.
++
++    The seven cameras are triggered in two groups whose offset from the LiDAR spin
++    centre is CLIP-SPECIFIC: measured over all 32 released clips the inter-group gap
++    runs from 0.01 ms (NCF-03, the groups coincide) to 29.77 ms (NCF-01), and the sign
++    flips between clips. So the timestamps have to be read per clip; there is no
++    constant to hardcode and no typical value to assume.
++
++    Sources, in order: ``calib/camera_timestamps.parquet``, then
++    ``videos/<cam>.timestamps.parquet`` matched to each spin centre by
++    ``argmin |t_cam - spin_center_us|`` (the converter's own frame-selection rule).
++    ``source="lidar"`` reinstates the old behaviour of giving every camera the spin
++    centre.
++    """
++    spin = load_spin_centers_us(clip_dir)
++    if source == "lidar":
++        logger.warning(
++            "[NVIDIA_AV_Fog] camera_timestamp_source='lidar': every camera is being given the "
++            "LiDAR spin-centre timestamp. This is the PRE-FIX behaviour; the real per-camera "
++            "offsets reach 29.77 ms between trigger groups."
++        )
++        return {c: spin.copy() for c in cam_names}
++
++    ct = os.path.join(clip_dir, "calib", "camera_timestamps.parquet")
++    if os.path.exists(ct):
++        df = pd.read_parquet(ct)
++        if "timestep_idx" in df.columns:
++            df = df.sort_values("timestep_idx").reset_index(drop=True)
++        missing = [c for c in cam_names if c not in df.columns]
++        if missing:
++            raise ValueError(f"{ct} is missing camera column(s) {missing}")
++        if len(df) != len(spin):
++            raise ValueError(f"{ct} has {len(df)} rows but the clip has {len(spin)} timesteps")
++        return {c: df[c].to_numpy().astype(np.int64) for c in cam_names}
++
++    out = {}
++    for c in cam_names:
++        f = os.path.join(clip_dir, "videos", f"{c}.timestamps.parquet")
++        if not os.path.exists(f):
++            raise FileNotFoundError(
++                "F1: real per-camera timestamps are required but were not found.\n"
++                f"  looked for {ct}\n  and for    {f}\n"
++                "Set data.pixel_source.camera_timestamp_source=lidar to deliberately reproduce "
++                "the superseded behaviour."
++            )
++        col = pd.read_parquet(f)["timestamp"].to_numpy().astype(np.int64)
++        idx = np.abs(col[None, :] - spin[:, None]).argmin(axis=1)
++        out[c] = col[idx]
++    return out
 +
 +
 +# ===========================================================================
@@ -568,17 +791,28 @@ index 0000000..ac5e20a
 +                f"num_cams={self.num_cams} not supported for nvidia_av_fog"
 +            )
 +        self._cam_names = cam_names
-+        # Fill per-slot native resolution so intrinsic scaling is correct.
-+        self.ORIGINAL_SIZE = [list(NATIVE_HW[c]) for c in cam_names]
 +
 +        scene_path = Path(self.data_path)
++        # Rectification v1/v2 selection (per-camera K + safe crop); see resolve_rectification.
++        (self.rect_version, self.images_dirname, self.labels_2d_dirname,
++         self._K_rect, self._crops) = resolve_rectification(
++            str(scene_path),
++            want=str(getattr(self.data_cfg, "rectification", "auto")),
++            apply_safe_crop=bool(getattr(self.data_cfg, "apply_safe_crop", True)),
++        )
++        logger.info(
++            f"[NVIDIA_AV_Fog] rectification {self.rect_version} "
++            f"(images {self.images_dirname}/, 2-D labels {self.labels_2d_dirname}/)"
++        )
++        # per-slot source resolution comes from the chosen K, not a hardcoded table
++        self.ORIGINAL_SIZE = [[self._K_rect[c]["h"], self._K_rect[c]["w"]] for c in cam_names]
 +        img_filepaths, dynamic_mask_filepaths, sky_mask_filepaths, feat_filepaths = (
 +            [], [], [], []
 +        )
 +        for t in range(self.start_timestep, self.end_timestep):
 +            for slot_idx, cam_name in enumerate(cam_names):
 +                img_filepaths.append(
-+                    str(scene_path / "images" / cam_name / f"frame_{t:04d}.jpg")
++                    str(scene_path / self.images_dirname / cam_name / f"frame_{t:04d}.jpg")
 +                )
 +                dynamic_mask_filepaths.append("")
 +                sky_mask_filepaths.append("")
@@ -589,10 +823,34 @@ index 0000000..ac5e20a
 +        self.feat_filepaths = np.array(feat_filepaths)
 +
 +    # ------------------------------------------------------------------
++    def load_rgb(self) -> None:
++        """Crop-aware override of ScenePixelSource.load_rgb.
++
++        Identical to the base implementation except that each image is cropped to its
++        camera's ``safe_crop`` BEFORE being resized to ``load_size``. Without this the
++        black rectification corners of the v2 canvas would be trained on, and the
++        intrinsics (which use the cropped cx/cy) would not match the pixels.
++        """
++        if not self.data_cfg.load_rgb:
++            return
++        from PIL import Image
++        from tqdm import tqdm as _tqdm
++
++        load_h, load_w = self.data_cfg.load_size[0], self.data_cfg.load_size[1]
++        images = []
++        for fname in _tqdm(self.img_filepaths, desc="Loading images", dynamic_ncols=True):
++            rgb = Image.open(fname).convert("RGB")
++            x, y, w, h = self._crops[Path(fname).parent.name]
++            if (x, y, w, h) != (0, 0, rgb.width, rgb.height):
++                rgb = rgb.crop((x, y, x + w, y + h))
++            images.append(rgb.resize((load_w, load_h), Image.BILINEAR))
++        self.images = torch.from_numpy(np.stack(images, axis=0)) / 255
++        self.img_ids = torch.arange(len(self.images)).long()
++
++    # ------------------------------------------------------------------
 +    def load_calibrations(self):
 +        scene_path = Path(self.data_path)
-+        with open(scene_path / "calib" / "K_rectified.json") as f:
-+            K_all = json.load(f)
++        K_all = self._K_rect  # crop-adjusted, from resolve_rectification()
 +        with open(scene_path / "calib" / "T_camera_rig.json") as f:
 +            T_cam_rig_all = json.load(f)
 +        # T_rig_world (NCore native ego→world per timestep)
@@ -600,11 +858,10 @@ index 0000000..ac5e20a
 +            str(scene_path / "calib" / "T_rig_world.parquet")
 +        )  # (T, 4, 4)
 +
-+        # The processed_pinhole world frame is already ISO 8855 (T_rig_world
-+        # translation grows along world +x = forward; obstacles_3d_world is in
-+        # the same frame). Premultiplying by ISO_8855_T4 used to mirror-reflect
-+        # everything (det=-1) and scrambled poses. Use the native frame directly.
-+        ego_to_world_iso = ego_to_world_native  # (T,4,4) -- already ISO
++        # The world frame is already ISO 8855 (T_rig_world's translation grows along
++        # world +x = forward; obstacles_3d_world is in the same frame), so it is used
++        # directly.
++        ego_to_world_iso = ego_to_world_native
 +        ego_to_world_start = ego_to_world_iso[self.start_timestep]
 +        inv_start = np.linalg.inv(ego_to_world_start)
 +        self.inv_start_ego_to_world = inv_start  # shared with LiDAR source
@@ -614,7 +871,9 @@ index 0000000..ac5e20a
 +        _intrinsics = []
 +        for slot_idx, cam_name in enumerate(self._cam_names):
 +            K = K_all[cam_name]
-+            native_h, native_w = NATIVE_HW[cam_name]
++            # The source size is the CROPPED size when safe_crop is on, so the intrinsic
++            # scaling to load_size has to use it (not a hardcoded native resolution).
++            native_h, native_w = int(K["h"]), int(K["w"])
 +            sx = load_w / native_w
 +            sy = load_h / native_h
 +            fx, fy = K["fx"] * sx, K["fy"] * sy
@@ -632,26 +891,52 @@ index 0000000..ac5e20a
 +            T_rig_from_cam = np.array(T_cam_rig_all[cam_name], dtype=np.float64)
 +            cam_to_egos.append(T_rig_from_cam)
 +
++        # ------- F1: per-camera capture times -------
++        # `timesteps` stays an integer index (the split machinery keys on it), but
++        # `timestamps` -- which is what gets normalised and fed to the dynamic/flow
++        # branch -- is now the camera's OWN time, expressed in frame units so the scale
++        # is unchanged: (t_cam - spin_center[start]) / frame_period. Previously all seven
++        # cameras of a timestep shared one integer, i.e. the two trigger groups were
++        # modelled as simultaneous when they can be up to 29.77 ms apart.
++        self.camera_timestamps_us = load_camera_timestamps_us(
++            str(scene_path), self._cam_names,
++            source=str(getattr(self.data_cfg, "camera_timestamp_source", "auto")),
++        )
++        spin_us = load_spin_centers_us(str(scene_path))
++        self.spin_centers_us = spin_us
++        t0_us = float(spin_us[self.start_timestep])
++        period_us = float(np.median(np.diff(spin_us))) if len(spin_us) > 1 else 1e5
++        self.frame_period_us = period_us
++        self.t0_us = t0_us
++        offsets_ms = {
++            c: float(np.median(self.camera_timestamps_us[c] - spin_us)) / 1e3 for c in self._cam_names
++        }
++        logger.info(
++            "[NVIDIA_AV_Fog] per-camera offset from the LiDAR spin centre (ms): "
++            + ", ".join(f"{c.replace('camera_', '')} {v:+.2f}" for c, v in offsets_ms.items())
++            + f" | spread {max(offsets_ms.values()) - min(offsets_ms.values()):.2f} ms"
++        )
++
 +        # ------- per-frame ego_to_world (rebased to start) and cam_to_world -------
 +        ego_to_worlds, cam_to_worlds, intrinsics = [], [], []
 +        cam_ids, timestamps, timesteps = [], [], []
 +        for t in range(self.start_timestep, self.end_timestep):
 +            ego_to_world_t = inv_start @ ego_to_world_iso[t]
 +            ego_to_worlds.append(ego_to_world_t)
-+            for slot_idx in range(len(self._cam_names)):
++            for slot_idx, cam_name in enumerate(self._cam_names):
 +                cam_ids.append(self.camera_list[slot_idx])
 +                c2w = ego_to_world_t @ cam_to_egos[slot_idx]
 +                cam_to_worlds.append(c2w)
 +                intrinsics.append(_intrinsics[slot_idx])
-+                # timesteps + timestamps both integer-relative-to-start (matches PandaSet)
-+                timestamps.append(t - self.start_timestep)
++                # integer index for bookkeeping, real (fractional) time for the model
++                timestamps.append((float(self.camera_timestamps_us[cam_name][t]) - t0_us) / period_us)
 +                timesteps.append(t - self.start_timestep)
 +
 +        self.intrinsics = torch.from_numpy(np.stack(intrinsics, axis=0)).float()
 +        self.cam_to_worlds = torch.from_numpy(np.stack(cam_to_worlds, axis=0)).float()
 +        self.ego_to_worlds = torch.from_numpy(np.stack(ego_to_worlds, axis=0)).float()
 +        self.cam_ids = torch.from_numpy(np.array(cam_ids, dtype=np.int64)).long()
-+        self._timestamps = torch.from_numpy(np.array(timestamps, dtype=np.float32)).float()
++        self._timestamps = torch.from_numpy(np.array(timestamps, dtype=np.float64)).float()
 +        self._timesteps = torch.from_numpy(np.array(timesteps, dtype=np.int64)).long()
 +
 +
@@ -663,8 +948,9 @@ index 0000000..ac5e20a
 +
 +    .npy sweeps are stored in the EGO frame at spin_center timestamp t. We
 +    transform each point to world coordinates via
-+        p_world = inv_start @ ISO_8855_T4 @ T_rig_world[t] @ p_ego
-+    (i.e. ego→native_world→ISO_world→canonical_world). The same compound
++        p_world = inv_start @ T_rig_world[t] @ p_ego
++    (i.e. ego→world→canonical_world; the world frame is already ISO 8855 so there is
++    no remap step). The same compound
 +    transform IS the lidar_to_world we expose; lidar = ego here because
 +    T_lidar_rig is so close to identity (translation only) we treat the
 +    lidar's origin as the ego origin for ray-bookkeeping, then we apply the
@@ -720,15 +1006,29 @@ index 0000000..ac5e20a
 +        T_rig_from_lidar = np.array(tl["lidar_top_360fov"], dtype=np.float64)
 +        self.lidar_to_ego = T_rig_from_lidar  # (4,4)
 +
++        # F3: frame of the stored xyz, from provenance.json (not assumed).
++        self.points_frame = resolve_lidar_frame(
++            str(scene_path),
++            forced=str(getattr(self.data_cfg, "points_frame", "auto")),
++            allow_unmarked=bool(getattr(self.data_cfg, "allow_unmarked_lidar_frame", False)),
++            mount_z=abs(float(T_rig_from_lidar[2, 3])),
++        )
++
 +        ego_to_world_native = _load_rig_world_poses(
 +            str(scene_path / "calib" / "T_rig_world.parquet")
 +        )  # (T,4,4)
-+        ego_to_world_iso = ego_to_world_native  # already ISO 8855; no extra rotation
++        ego_to_world_iso = ego_to_world_native  # already ISO 8855
 +        # canonical_from_world @ world_from_ego @ ego_from_lidar = canonical_from_lidar
 +        l2ws = []
 +        for t in range(self.start_timestep, self.end_timestep):
 +            l2ws.append(self.inv_start @ ego_to_world_iso[t] @ self.lidar_to_ego)
 +        self.lidar_to_worlds = torch.from_numpy(np.stack(l2ws, axis=0)).float()
++
++        # Camera/LiDAR share one time origin and scale (see the pixel source).
++        spin_us = load_spin_centers_us(str(scene_path))
++        t0_us = float(spin_us[self.start_timestep])
++        period_us = float(np.median(np.diff(spin_us))) if len(spin_us) > 1 else 1e5
++        self.frame_times = (spin_us[self.start_timestep:self.end_timestep].astype(np.float64) - t0_us) / period_us
 +
 +        # Also cache ego_to_world (canonical) so we can transform raw ego-frame points.
 +        e2ws = []
@@ -747,7 +1047,14 @@ index 0000000..ac5e20a
 +            desc="Loading NVIDIA_AV_Fog LiDAR", dynamic_ncols=True,
 +        )):
 +            sweep = np.load(self.lidar_filepaths[i])  # (N, 6) float32
-+            xyz_ego = sweep[:, :3].astype(np.float32)
++            xyz_raw = sweep[:, :3].astype(np.float32)
++            if self.points_frame == "sensor":
++                # lidar-sensor -> ego/rig. Without this the ground sits mount_z (1.94 m)
++                # too low in world coordinates. See resolve_lidar_frame().
++                L = self.lidar_to_ego.astype(np.float32)
++                xyz_ego = xyz_raw @ L[:3, :3].T + L[:3, 3][None, :]
++            else:
++                xyz_ego = xyz_raw
 +            intensity = sweep[:, 3].astype(np.float32)
 +            ring_id = sweep[:, 5].astype(np.int64)
 +
@@ -790,7 +1097,10 @@ index 0000000..ac5e20a
 +            accumulated_kept += n_kept
 +
 +            timestep_idx = t_global - self.start_timestep
-+            ts_t = torch.full((n_kept,), float(timestep_idx))
++            # Same clock as the cameras: frame units measured from spin_center[start].
++            # Identical to `timestep_idx` up to the (sub-microsecond) spin-period jitter,
++            # but it keeps the two modalities on one definition rather than two.
++            ts_t = torch.full((n_kept,), float(self.frame_times[timestep_idx]))
 +
 +            origins.append(origin_t)
 +            directions.append(dirs)
@@ -804,6 +1114,7 @@ index 0000000..ac5e20a
 +            f"[NVIDIA_AV_Fog-LiDAR] kept {accumulated_kept}/{accumulated} rays "
 +            f"({100.0*accumulated_kept/max(accumulated,1):.1f}%)"
 +        )
++        self._log_ground_plane_check()
 +        self.origins = torch.cat(origins, dim=0)
 +        self.directions = torch.cat(directions, dim=0)
 +        self.ranges = torch.cat(ranges, dim=0)
@@ -813,6 +1124,32 @@ index 0000000..ac5e20a
 +        self._timesteps = torch.cat(timesteps, dim=0).long()
 +
 +    # ------------------------------------------------------------------
++    def _log_ground_plane_check(self) -> None:
++        """Sanity block: ground z of the first sweep under the resolved frame.
++
++        p10 of z over points 6-20 m out. Expect ~0 m once the points are in the ego
++        frame; ~-mount_z means the sensor->ego step was skipped. A strong road gradient
++        can move this, so it is logged, not asserted.
++        """
++        try:
++            sweep = np.load(self.lidar_filepaths[0])
++        except Exception:  # pragma: no cover - diagnostics only
++            return
++        xyz = sweep[:, :3].astype(np.float32)
++        if self.points_frame == "sensor":
++            L = self.lidar_to_ego.astype(np.float32)
++            xyz = xyz @ L[:3, :3].T + L[:3, 3][None, :]
++        r = np.hypot(xyz[:, 0], xyz[:, 1])
++        sel = xyz[(r > 6.0) & (r < 20.0), 2]
++        if sel.size < 1000:
++            return
++        mount_z = abs(float(self.lidar_to_ego[2, 3]))
++        logger.info(
++            f"[NVIDIA_AV_Fog-LiDAR] frame='{self.points_frame}' ground z (p10, 6-20 m, ego) = "
++            f"{np.percentile(sel, 10):+.2f} m (expect ~0.00; ~{-mount_z:+.2f} would mean the "
++            f"sensor->ego step is missing)"
++        )
++
 +    def to(self, device):
 +        self.device = device
 +        for name in ("origins", "directions", "ranges",

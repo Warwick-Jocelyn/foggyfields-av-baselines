@@ -13,17 +13,14 @@
 # limitations under the License.
 """Data parser for the NVIDIA_AV_Fog dataset (5 fog-daytime clips derived from NVIDIA NCore).
 
-Layout expected under ``--data``::
+Two on-disk layouts are supported under ``--data`` (see ``_resolve_clip_root``)::
 
-    <data>/
-      processed/
-        002_<uuid>_fog_day_rural/processed_pinhole/{images,lidar,labels,splits,calib,...}
-        003_<uuid>_fog_day_residual/processed_pinhole/...
-        004_<uuid>_fog_day_highway_with_cars/processed_pinhole/...
-        ...
+    <data>/clips/NFF-01__b9ea7a9d/{images,lidar,labels,splits,calib,videos,...}   # live
+    <data>/NVIDIA_FOGGY_Field/clips/NFF-01__b9ea7a9d/...                          # live, parent root
+    <data>/processed/002_<uuid>_fog_day_rural/processed_pinhole/...               # legacy
 
-Use ``--sequence`` to pick a clip (matched by leading-digit prefix or by uuid prefix,
-e.g. ``002`` or ``b9ea7a9d``).
+Use ``--sequence`` to pick a clip: ``NFF-01``, ``b9ea7a9d``, the full directory name, or
+-- legacy layout only -- a leading 3-digit prefix such as ``002``.
 """
 
 import json
@@ -35,7 +32,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from nerfstudio.cameras.cameras import Cameras, CameraType
+from nerfstudio.cameras.cameras import Cameras, CameraType, RollingShutterLookup
 from nerfstudio.cameras.lidars import Lidars, LidarType
 from nerfstudio.data.dataparsers.ad_dataparser import (
     DUMMY_DISTANCE_VALUE,
@@ -43,6 +40,7 @@ from nerfstudio.data.dataparsers.ad_dataparser import (
     ADDataParser,
     ADDataParserConfig,
 )
+from nerfstudio.utils.rich_utils import CONSOLE
 
 # Camera order is fixed; sensor_idx is the index into this tuple.
 NVIDIA_AV_FOG_CAMERAS: Tuple[str, ...] = (
@@ -57,20 +55,29 @@ NVIDIA_AV_FOG_CAMERAS: Tuple[str, ...] = (
 
 NVIDIA_AV_FOG_LIDAR: str = "lidar_top_360fov"
 
-# NCore native rig: +x=left, +y=forward, +z=up.
-# ISO 8855:        +x=forward, +y=left,    +z=up.
-# Rotation that takes a point's NCore-frame coords to ISO coords:
-#     p_iso = R_iso_from_ncore @ p_ncore
-# Derivation:
-#     x_iso (fwd)  = y_ncore (fwd)
-#     y_iso (left) = x_ncore (left)
-#     z_iso (up)   = z_ncore (up)
-R_ISO_FROM_NCORE = np.array(
-    [[0.0, 1.0, 0.0],
-     [1.0, 0.0, 0.0],
-     [0.0, 0.0, 1.0]],
-    dtype=np.float64,
+# The seven cameras are NOT exposed simultaneously. They split into two trigger groups
+# (see DATASET_NOTES.md "F1"):
+#   group A: front_wide, rear_left, rear_right, front_tele
+#   group B: cross_left, cross_right, rear_tele
+# Intra-group jitter is +-0.1 ms, so each group has one well-defined time. The offset
+# BETWEEN the groups is CLIP-SPECIFIC: over all 32 released clips it runs from 0.01 ms
+# (NCF-03, the groups coincide) to 29.77 ms (NCF-01), and its sign flips between clips.
+# There is no constant to hardcode and no typical value to assume -- the timestamps must
+# be read from each clip. Never reuse the LiDAR timestamp for a camera. The groups below
+# are used only to summarise the measured offsets in the parse log.
+NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS: Tuple[Tuple[str, ...], Tuple[str, ...]] = (
+    ("camera_front_wide_120fov", "camera_rear_left_70fov", "camera_rear_right_70fov", "camera_front_tele_30fov"),
+    ("camera_cross_left_120fov", "camera_cross_right_120fov", "camera_rear_tele_30fov"),
 )
+
+# NOTE: a 3x3 "ISO 8855" remap used to live here as
+#     R_ISO_FROM_NCORE = [[0,1,0],[1,0,0],[0,0,1]]
+# It has determinant -1 -- a REFLECTION, not a rotation, so it would have mirrored the
+# scene rather than rotated it. It was already unused (apply_iso_8855_rotation defaulted
+# to False) because the released data is ALREADY in ISO 8855: CONVENTIONS.md specifies
+# +x forward / +y left / +z up for the ego and world frames, and T_rig_world's
+# translation grows along world +x. No remap is needed, so the matrix and its config
+# flag are deleted rather than left lying around for someone to switch on.
 
 # NCore LiDAR sweep `[N,6]` columns: x, y, z, intensity (already 0-1), t_offset_us, ring_id.
 LIDAR_SWEEP_COL_X = 0
@@ -78,29 +85,86 @@ LIDAR_SWEEP_COL_INTENSITY = 3
 LIDAR_SWEEP_COL_T_OFFSET_US = 4
 LIDAR_SWEEP_COL_RING_ID = 5
 
-# Allowed NCore obstacle classes. NCore auto-labels v2 surface these for the fog clips:
-#   automobile, trailer, heavy_truck, bus, motorcycle, bicycle, ... (pedestrian/two-wheeler rare)
-NVIDIA_AV_FOG_ALLOWED_RIGID_CLASSES: Tuple[str, ...] = (
+# ---------------------------------------------------------------------------------
+# F4. The real NCore obstacle vocabulary.
+#
+# Counted over every box of all 15 fog clips and all 17 clear clips:
+#
+#   class               fog      clear
+#   automobile        22710     103684
+#   person               93      53585
+#   heavy_truck        3763       1844
+#   rider                50       1827
+#   trailer            1256       1416
+#   bus                 217       1055
+#   train_or_tram_car     0        755
+#   stroller              0        724
+#   animal              856         31
+#   protruding_object    64        325
+#   other_vehicle       521        206
+#
+# What the previous lists got wrong:
+#   * the rigid whitelist contained motorcycle / bicycle / train / trolley / tram,
+#     none of which NCore ever emits -- five dead entries;
+#   * the deformable list was pedestrian / person / two_wheeler: `pedestrian` and
+#     `two_wheeler` do not exist, and `rider` -- which IS NCore's cyclist /
+#     motorcyclist class -- was missing entirely;
+#   * `animal` (856 fog boxes, 4x more than bus) and `protruding_object` were in
+#     neither list and were dropped without a word;
+#   * `train_or_tram_car` (755 clear boxes) and `stroller` (724) appear in neither.
+#
+# Assignments below are deliberate; `class_taxonomy.json` in each clip carries NCore's
+# own nuScenes/COCO mapping and agrees with the vehicle/person split.
+# ---------------------------------------------------------------------------------
+
+# Rigid, left-right symmetric: a box can be mirrored about its long axis.
+NVIDIA_AV_FOG_RIGID_CLASSES: Tuple[str, ...] = (
     "automobile",
-    "trailer",
     "heavy_truck",
     "bus",
+    "trailer",
     "other_vehicle",
-    "motorcycle",
-    "bicycle",
-    "train",
-    "trolley",
-    "tram",
-)
-NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES: Tuple[str, ...] = (
-    "pedestrian",
-    "person",
-    "two_wheeler",
+    "train_or_tram_car",
 )
 
-# Sensor specs for the NCore 128-line top LiDAR. Beam divergences are not published
-# by NVIDIA; we reuse the Pandar64 values as conservative defaults. They only matter
-# for `add_missing_points` (which is off by default) and for ray-drop modeling.
+# Rigid but NOT symmetric -- the shape has a clear front/back and is small enough that
+# mirroring is visible.
+NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES: Tuple[str, ...] = ("stroller",)
+
+# Deformable: the actor's shape changes over the track, so the rigid-box actor model
+# does not hold. `rider` is a judgement call -- the box contains a person on a
+# two-wheeler, which articulates and leans; we treat it as deformable rather than as a
+# rigid vehicle. `animal` likewise.
+NVIDIA_AV_FOG_DEFORMABLE_CLASSES: Tuple[str, ...] = (
+    "person",
+    "rider",
+    "animal",
+)
+
+# Not an actor: infrastructure / cargo sticking into the road. These belong to the
+# static field, not to the dynamic-actor branch. Enable with
+# `--include-static-object-actors True` if you want them as (stationary) actors.
+NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES: Tuple[str, ...] = ("protruding_object",)
+
+NVIDIA_AV_FOG_KNOWN_CLASSES: Tuple[str, ...] = (
+    NVIDIA_AV_FOG_RIGID_CLASSES
+    + NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES
+    + NVIDIA_AV_FOG_DEFORMABLE_CLASSES
+    + NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES
+)
+
+# F6. The top LiDAR is a 128-beam row-offset spinning unit; `calib/lidar_intrinsics.json`
+# publishes its real geometry per clip (per-vehicle calibration):
+#   n_rows 128, n_columns 3600, spinning_frequency_hz 10.0, spinning_direction "cw",
+#   row_elevations_rad[128], column_azimuths_rad[3600], row_azimuth_offsets_rad[128]
+# The parser used LidarType.PANDAR64 -- a 64-beam sensor -- whose 64 static elevations
+# then drove the range-image rasterisation and therefore the ray-drop model, one of
+# NeuRAD's selling points. We now declare LidarType.NCORE128 and hand the measured
+# elevations/azimuths to `Lidars`, which both SplatAD and the lidar datamanager prefer
+# over the enum's static table.
+#
+# Beam divergence genuinely is NOT published by NVIDIA. The Pandar64 values below stay
+# as the default, but they are now config fields so an ablation is one flag.
 HORIZONTAL_BEAM_DIVERGENCE = 3e-3
 VERTICAL_BEAM_DIVERGENCE = 1.5e-3
 
@@ -116,10 +180,13 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     """
 
     _target: Type = field(default_factory=lambda: NvidiaAvFog)
-    data: Path = Path("/networkhome/WMGDS/wang3_y/ETH/Dataset/NVIDIA_AV_Fog")
-    """Root of the NVIDIA_AV_Fog dataset (contains processed/<clip>/...)."""
-    sequence: str = "002"
-    """Clip prefix or uuid prefix selecting a clip under processed/."""
+    data: Path = Path("/home/wang3_y_WMGDS.WMG.WARWICK.AC.UK/Dataset/physicalai_av/NVIDIA_FOGGY_Field")
+    """Dataset root. Either a subset root holding ``clips/`` (live layout), a parent holding
+    ``NVIDIA_FOGGY_Field/clips`` and/or ``NVIDIA_CLEAR_Field/clips``, or a legacy root
+    holding ``processed/<clip>/processed_pinhole``."""
+    sequence: str = "NFF-01"
+    """Clip selector: ``NFF-01`` / ``NCF-08``, the hash, the full directory name, or a
+    legacy 3-digit prefix such as ``002``."""
 
     cameras: Tuple[
         Literal[
@@ -146,39 +213,175 @@ class NvidiaAvFogDataParserConfig(ADDataParserConfig):
     min_lidar_dist: Tuple[float, float, float] = (1.0, 2.0, 2.0)
     """Drop points closer than this (sensor frame). Conservative defaults for ego."""
 
-    # NCore ftheta -> pinhole rectification is per-frame near-instantaneous from the
-    # dataset's perspective (we already have pinhole frames on disk). The rolling-shutter
-    # time and time-to-center-pixel for the source ftheta cameras are not published; we
-    # leave them at zero (treat as global-shutter). This is consistent with how the
-    # rectified pinhole frames are produced.
-    rolling_shutter_time: float = 0.0
-    time_to_center_pixel: float = 0.0
+    # ---- F2: rolling shutter ------------------------------------------------------
+    rolling_shutter_source: Literal["calib", "config"] = "calib"
+    """``calib`` (default) reads the PUBLISHED rolling-shutter readout time from
+    ``calib/camera_intrinsics_ftheta.json``: every camera of every clip, fog and clear,
+    carries ``"shutter_type": "ROLLING_TOP_TO_BOTTOM"`` and ``"shutter_delay_us": 30559``
+    (checked: 224/224 camera-clip entries). That is 30.559 ms of readout inside a 33.331 ms
+    frame period -- the frame is very nearly always mid-readout.
 
-    apply_iso_8855_rotation: bool = False
-    """If True, apply ``R_iso_from_ncore`` to all world-frame poses (cam, lidar, cuboid).
-    The processed_pinhole/ data is already in ISO 8855 (T_rig_world translation
-    grows along world +x = forward; obstacles_3d_world is in the same world frame),
-    so the default is now False. KNOWN_ISSUES I-003 refers to obstacles_3d_*ego*.parquet
-    only — we read the _world_ variant."""
+    The original config set ``rolling_shutter_time = 0.0`` with a comment claiming the
+    value was "not published". It is published; the comment was wrong.
+
+    ``config`` uses ``rolling_shutter_time`` below verbatim; set both to reproduce the
+    superseded global-shutter runs (``--rolling-shutter-source config
+    --rolling-shutter-time 0.0``)."""
+
+    rolling_shutter_time: float = 0.0
+    """Only consulted when ``rolling_shutter_source == "config"``. With ``calib`` this
+    field is overwritten at parse time by the published value (0.030559 s)."""
+
+    time_to_center_pixel: float = 0.0
+    """Offset from the stored image timestamp to the time the CENTRE row is read out.
+
+    0 IS THE RIGHT VALUE HERE, but only because the dataset says so. nerfstudio computes
+        time_offset(row) = (row / height - 0.5) * rolling_shutter_time + time_to_center_pixel
+    so a non-zero value is needed exactly when the image timestamp means the START of the
+    frame rather than its CENTRE. NVIDIA documents neither, and the DriveWorks image
+    timestamp struct carries both a start-of-frame and a frame-midpoint field, so which
+    one the NCore export wrote is not visible from the released files.
+
+    What settles it is the dataset's own `calib/rs_time_offset/README.json`, which states
+    the per-pixel offsets are "seconds, relative to the frame exposure timestamp in
+    calib/camera_timestamps.parquet (mid-frame readout)" and derives them as
+    `(row/src_h - 0.5) * shutter_delay_us`, symmetric about 0 (+-15.279 ms). The loaded
+    tables agree: their medians are -3.4 ms on the 120 deg cameras and -0.1 ms on the
+    teles, i.e. centred, not offset by a half readout.
+
+    That is the dataset toolkit's assertion about NVIDIA's timestamps, not NVIDIA's own
+    statement, so it is a documented assumption rather than a proof. If it is ever
+    contradicted, the start-of-frame value would be shutter_delay_us/2 = 0.0152795, and
+    the loader warns if README.json stops saying "mid-frame"."""
 
     splits_json: Literal["reconstruction_all", "nvs_50_50", "nvs_80_20", "nvs_90_10", "auto"] = "auto"
     """If not 'auto', read ``processed_pinhole/splits/<name>.json`` directly. Otherwise
     defer to the parent class' LINSPACE split (which matches ``nvs_50_50`` for
     ``train_split_fraction=0.5``)."""
 
-    include_deformable_actors: bool = False
+    include_deformable_actors: bool = True
+    """Load person / rider / animal tracks. Upstream's default is False; we flip it here
+    because on this dataset it is not a corner case -- `person` is 53,585 of the clear
+    set's boxes (NCF-08 alone has 19,396) and `rider` another 1,827. With False they are
+    all silently absent from the dynamic-actor branch. Set False to reproduce the
+    superseded runs."""
 
-    lidar_points_frame: Literal["ego", "sensor"] = "ego"
-    """Frame of the xyz columns in ``lidar/sweep_*.npy``. The original code assumed "ego" and mapped the
-    points into the lidar-sensor frame with inv(T_lidar_rig). On the packaged NFF release the sweeps are
-    already in the SENSOR frame (ground plane sits at z≈-1.94 m = minus the lidar mount height; verified
-    2026-10-12), so "sensor" (= use the points as-is) is the geometrically correct setting. Default stays
-    "ego" to reproduce the published runs exactly."""
+    include_static_object_actors: bool = False
+    """Load `protruding_object` (64 fog / 325 clear boxes) as actors. Off by default:
+    these are infrastructure/cargo and belong to the static field."""
 
-    use_valid_masks: bool = False
-    """If True, attach ``masks/<cam>/valid_mask.png`` (the ftheta->pinhole valid region) as the
-    per-image mask so the black rectification corners are excluded from the RGB loss and from
-    the model's own eval metrics. Off by default to stay faithful to the published runs."""
+    # ---- F6: LiDAR model -----------------------------------------------------------
+    use_published_beam_geometry: bool = True
+    """Read `calib/lidar_intrinsics.json` and hand the real 128 beam elevations and 3600
+    column azimuths to `Lidars`. False falls back to the LidarType's static table, i.e.
+    the superseded 64-beam Pandar64 grid."""
+
+    horizontal_beam_divergence: float = HORIZONTAL_BEAM_DIVERGENCE
+    vertical_beam_divergence: float = VERTICAL_BEAM_DIVERGENCE
+    """Beam divergence, radians. NVIDIA does not publish these for the NCore lidar; the
+    defaults are Pandar64's and are a stated assumption, not a measurement."""
+
+    use_range_image_raydrop: bool = True
+    """Use `lidar/range_image/*.npy` (128 x 3600 with explicit non-returns) to add the
+    rays that did not return, instead of inferring them from the elevation/azimuth grid
+    (`add_missing_points`). Silently inactive when the directory is absent -- it is being
+    generated now and does not exist in every clip yet."""
+
+    stationary_speed_threshold: float = 0.5
+    """F5. A track whose PEAK speed stays below this (m/s) is marked ``stationary``.
+    `obstacles_3d_world.parquet` carries `velocity_x_mps` / `velocity_y_mps`; if they are
+    absent the speed is finite-differenced from the box centres instead. Measured at 0.5
+    m/s: 4 of 704 fog tracks (0.6%) and 30 of 3316 clear tracks (0.9%) are stationary."""
+
+    unknown_class_policy: Literal["error", "warn", "drop"] = "error"
+    """What to do with a `label_class` that is in none of the lists above. `error`
+    (default) fails at parse time, seconds into a run, naming the class and its count --
+    the previous behaviour was to drop it silently, which is how `animal` and
+    `protruding_object` went missing. `warn` keeps going; `drop` restores the old
+    silence."""
+
+    # ---- F3: LiDAR point frame ----------------------------------------------------
+    lidar_points_frame: Literal["auto", "ego", "sensor"] = "auto"
+    """Frame of the xyz columns in ``lidar/sweep_*.npy``.
+
+    ``auto`` (default) READS ``provenance.lidar_frame`` from the clip instead of trusting a
+    config default, because the answer differs per clip and is being changed in place:
+    the clear clips are already converted to true ego frame and marked ``"ego"``, the fog
+    clips are mid-conversion -- some marked ``"ego"``, the rest not marked at all and still
+    in the SENSOR frame.
+
+    Getting this wrong is a 1.94 m vertical error: the old default ``"ego"`` applied
+    inv(T_lidar_rig) to points that were already in the sensor frame, putting the
+    world-frame ground at -1.94 m instead of 0. That is what the published NeuRAD /
+    SplatAD numbers were trained on.
+
+    ``ego`` / ``sensor`` force the answer and override the marker (with a warning) -- use
+    them for clips that predate the marker."""
+
+    allow_unmarked_lidar_frame: bool = False
+    """Opt-in for clips with no ``provenance.lidar_frame``: treat them as legacy SENSOR
+    frame. Off by default so an unmarked clip can never be loaded on a guess; the error
+    names this flag."""
+
+    check_lidar_frame_geometry: bool = True
+    """Cross-check the declared frame against the measured ground plane of one sweep and
+    warn if the other hypothesis fits ~1.9 m better. Costs one ``np.load``."""
+
+    camera_timestamp_source: Literal["auto", "per_camera", "lidar"] = "auto"
+    """Where the per-image capture time comes from.
+
+    ``per_camera`` (and ``auto`` when the data supports it) reads the REAL per-camera
+    timestamps, in this order:
+      1. ``calib/camera_timestamps.parquet`` (``timestep_idx`` + one column per camera),
+      2. ``videos/<cam>.timestamps.parquet`` column ``timestamp``, matched to each LiDAR
+         spin centre by nearest neighbour (exactly the frame-selection rule the dataset
+         converter used to pick the rectified frame).
+    ``lidar`` reproduces the ORIGINAL, DEFECTIVE behaviour -- every camera inherits the
+    LiDAR spin-centre timestamp. Keep it only to re-create pre-fix runs on purpose. The
+    cost is clip-specific: per-camera offsets span -15.75 .. +16.06 ms across the 32
+    released clips, the two trigger groups are 0.01 .. 29.77 ms apart, and the worst
+    inter-group displacement is 65 cm of ego motion (NFF-14). It also corrupts
+    dynamic-actor pose interpolation, which is done in time.
+    ``auto`` = ``per_camera`` if either source exists, else hard error (it never silently
+    degrades to the LiDAR timestamp)."""
+
+    use_valid_masks: bool = True
+    """Attach the per-camera valid-region mask (``masks[_rectv2]/<cam>/valid_mask.png``) so the
+    black rectification corners stay out of the RGB loss and out of the model's own eval
+    metrics. NOW ON BY DEFAULT: the v2 valid region is not rectangular, so even with
+    ``apply_safe_crop`` there is no setting in which training on the invalid pixels is
+    correct. False reproduces the superseded runs."""
+
+    # ---- rectification v2 ------------------------------------------------------------
+    rectification: Literal["auto", "v1", "v2"] = "auto"
+    """Which rectification to train on.
+
+    v1 put all seven cameras on ONE virtual pinhole (fx=fy=640, 1280x960, 90 deg FOV),
+    which cost the 30 deg teles 5.8x of angular resolution and left 95% of their canvas
+    empty. v2 gives each camera its own K at that lens's native angular resolution
+    (``calib/K_rectified_v2.json``, ``images_rectv2/``), 11.2 -> 65.2 px/deg on the front
+    tele. ``auto`` picks v2 when the clip has it, else v1. See RECTIFY_V2.md."""
+
+    apply_safe_crop: bool = True
+    """v2 only. Crop each image to the ``safe_crop`` rectangle from
+    ``K_rectified_v2.json`` -- the largest rectangle containing zero invalid pixels -- and
+    take cx/cy from INSIDE that block (fx/fy are unaffected by the crop). Without this the
+    black lens-cone corners of the v2 canvas enter the loss for any pipeline that ignores
+    masks. Reading the top-level w/h instead of the safe_crop block is the specific
+    mistake this flag exists to prevent."""
+
+    rs_time_offset_lookup: bool = True
+    """Use ``calib/rs_time_offset/<cam>.npy`` (per-output-pixel readout time, stored at 1/8
+    resolution, sampled bilinearly) in place of the row-linear rolling-shutter formula.
+    Rectification smears one v2 output row across a median of 104 source rows (max 178) of
+    1080 on the 120 deg cameras = 2.93 ms (max 5.05), 35 px on the 70 deg, 7 px on the
+    teles. Real, but typically smaller than F1 (per-camera offsets up to 16.06 ms,
+    trigger groups up to 29.77 ms apart), so F1 matters more. Silently inactive when the
+    files are absent -- they exist on 25 of 32 clips as of 2026-10-19."""
+
+    image_cache_warn_gb: float = 32.0
+    """Log a warning when the projected image cache exceeds this. v2 is up to 2692x1880,
+    4.1x the pixels of v1, and nerfstudio caches every training image."""
 
 
 @dataclass
@@ -190,25 +393,24 @@ class NvidiaAvFog(ADDataParser):
     # Populated in _generate_dataparser_outputs() before the parent runs:
     clip_root: Path = Path()  # processed_pinhole/ for the chosen sequence
     K_per_cam: Dict[str, Dict] = field(default_factory=dict)
+    rect_version: str = "v1"          # "v1" | "v2", resolved by _select_rectification()
+    images_dirname: str = "images"
+    masks_dirname: str = "masks"
+    labels_2d_dirname: str = "labels"
     T_camera_rig: Dict[str, np.ndarray] = field(default_factory=dict)   # 4x4, p_cam = T @ p_ego
     T_lidar_rig: np.ndarray = field(default_factory=lambda: np.eye(4))  # 4x4, p_lidar = T @ p_ego
     T_rig_world: np.ndarray = field(default_factory=lambda: np.zeros((0, 4, 4)))  # [T,4,4] p_world = T @ p_ego
-    timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds
+    timestamps_us: np.ndarray = field(default_factory=lambda: np.zeros((0,)))     # [T] microseconds (LiDAR spin centre)
+    camera_timestamps_us: Dict[str, np.ndarray] = field(default_factory=dict)    # cam -> [T] microseconds
+    lidar_frame: str = "sensor"  # resolved from provenance.lidar_frame; see _resolve_lidar_frame()
+    lidar_n_rows: int = 0
+    lidar_n_cols: int = 0
+    lidar_row_elevations: np.ndarray = field(default_factory=lambda: np.zeros((0,)))
+    lidar_col_azimuths: np.ndarray = field(default_factory=lambda: np.zeros((0,)))
     num_timesteps: int = 0
     # Per-camera/lidar metadata for split lookup:
     _cam_timestep: List[int] = field(default_factory=list)
     _lidar_timestep: List[int] = field(default_factory=list)
-
-    # ----- World-frame conventions ------------------------------------------------
-
-    @property
-    def _world_rotation(self) -> np.ndarray:
-        """4x4 transform: world_iso = R_iso_from_world @ world_ncore (identity if disabled)."""
-        if not self.config.apply_iso_8855_rotation:
-            return np.eye(4)
-        T = np.eye(4)
-        T[:3, :3] = R_ISO_FROM_NCORE
-        return T
 
     # ----- Dataset entrypoint ----------------------------------------------------
 
@@ -222,7 +424,6 @@ class NvidiaAvFog(ADDataParser):
             data_root = type(self.config).__dataclass_fields__["data"].default
         self.clip_root = _resolve_clip_root(data_root, self.config.sequence)
         # Load all calibration once.
-        self.K_per_cam = json.loads((self.clip_root / "calib" / "K_rectified.json").read_text())
         T_cam_raw = json.loads((self.clip_root / "calib" / "T_camera_rig.json").read_text())
         self.T_camera_rig = {k: _list_to_4x4(v) for k, v in T_cam_raw.items()}
         T_lid_raw = json.loads((self.clip_root / "calib" / "T_lidar_rig.json").read_text())
@@ -238,24 +439,509 @@ class NvidiaAvFog(ADDataParser):
         self.T_rig_world = Trw
         self.timestamps_us = pose_df["timestamp_us"].to_numpy().astype(np.int64)
         self.num_timesteps = T
+        self._select_rectification()
+        self.camera_timestamps_us = self._load_camera_timestamps()
+        self._apply_rolling_shutter_config()
+        self.lidar_frame = self._resolve_lidar_frame()
         # If a fixed split file was requested, load timestep indices for it.
         self._train_timesteps, self._eval_timesteps = self._load_split_indices()
         outputs = super()._generate_dataparser_outputs(split)
         if self.config.use_valid_masks:
-            # image path is <clip_root>/images/<cam>/frame_XXXX.jpg -> mask is per-camera, time-invariant
+            # image path is <clip_root>/<images_dirname>/<cam>/frame_XXXX.jpg
+            # -> the mask is per-camera and time-invariant
             outputs.mask_filenames = [
-                self.clip_root / "masks" / Path(f).parent.name / "valid_mask.png" for f in outputs.image_filenames
+                self.clip_root / self.masks_dirname / Path(f).parent.name / "valid_mask.png"
+                for f in outputs.image_filenames
             ]
             missing = [m for m in set(outputs.mask_filenames) if not m.exists()]
             if missing:
                 raise FileNotFoundError(f"use_valid_masks=True but masks are missing: {missing}")
+        self._attach_image_crops(outputs)
+        outputs.metadata["rectification"] = self.rect_version
+        outputs.metadata["labels_2d_dir"] = self.clip_root / self.labels_2d_dirname
+        self._attach_rolling_shutter_lookup(outputs)
         return outputs
+
+    def _attach_image_crops(self, outputs) -> None:
+        """Hand the per-image safe crop to InputDataset.
+
+        The crop has to happen at image load, not in the dataparser: the reported
+        width/height and the principal point describe the CROPPED image, so the pixels
+        must be cropped to match. ``metadata["image_crops"]`` is [N, 4] = (x, y, w, h) in
+        original canvas pixels, aligned with ``image_filenames``.
+        """
+        # Resolved per filename (the camera is the image's parent directory), so this is
+        # immune to however the train/eval split reorders the images.
+        crops = [tuple(self.K_per_cam[Path(f).parent.name]["crop"]) for f in outputs.image_filenames]
+        if not crops or all(c[0] == 0 and c[1] == 0 for c in crops):
+            return  # nothing to crop (v1, or safe_crop disabled)
+        outputs.metadata["image_crops"] = torch.tensor(crops, dtype=torch.int32)
+        x, y, w, h = crops[0]
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG safe crop active: e.g. ({x}, {y}) {w}x{h} out of the full v2 canvas "
+            f"({len(set(crops))} distinct crops across {len(crops)} images)"
+        )
+
+    def _attach_rolling_shutter_lookup(self, outputs) -> None:
+        """Per-output-pixel readout time from ``calib/rs_time_offset/``.
+
+        ``calib/rs_time_offset/README.json`` documents the format, and the loader asserts
+        against it rather than assuming::
+
+            units   seconds, relative to the exposure timestamp in camera_timestamps.parquet
+            stride  8
+            grid    small[y, x] = t at v2 canvas pixel (min(8*y, h-1), min(8*x, w-1))
+            upsample  cv2.remap(small, x/8, y/8, INTER_LINEAR, BORDER_REPLICATE)
+            derivation  v2 pixel -> ray -> incidence angle -> angle_to_pixeldist_poly ->
+                        f-theta source row -> t = (row/src_h - 0.5) * shutter_delay_us
+
+        `RollingShutterLookup` reproduces that upsample exactly (bilinear in canvas-index
+        space, replicated border), so no table is materialised at full resolution.
+
+        Two things this has to get right and the naive reading does not:
+          * the tables live on the FULL v2 canvas, not on the safe crop, so the crop
+            origin is passed in as an offset;
+          * the measured spread is real but modest -- 2.7 ms median / 5.0 ms max on the
+            120 deg cameras, 1.0 / 1.9 on the 70 deg, 0.17 / 0.41 on the teles -- i.e.
+            generally under F1's per-camera offsets (up to 16.06 ms, and up to 29.77 ms
+            between the two trigger groups). This is a refinement, not the main event.
+        """
+        if not self.config.rs_time_offset_lookup:
+            return
+        d = self.clip_root / "calib" / "rs_time_offset"
+        if not d.is_dir():
+            return
+        readme = {}
+        readme_path = d / "README.json"
+        if readme_path.exists():
+            readme = json.loads(readme_path.read_text())
+            stride_doc = float(readme.get("stride", 8))
+            if "mid-frame" not in str(readme.get("units", "")):
+                CONSOLE.print(
+                    f"[bold yellow]NVIDIA_AV_FOG: {readme_path} no longer says the offsets are "
+                    f"relative to a mid-frame timestamp ('{readme.get('units')}'). "
+                    f"time_to_center_pixel={self.config.time_to_center_pixel} may now be wrong."
+                    f"[/bold yellow]"
+                )
+        else:
+            stride_doc = 8.0
+
+        cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
+        tables: Dict[int, torch.Tensor] = {}
+        strides: Dict[int, float] = {}
+        offsets: Dict[int, Tuple[int, int]] = {}
+        for slot, cam in enumerate(cams):
+            f = d / f"{cam}.npy"
+            if not f.exists():
+                CONSOLE.print(
+                    f"[bold yellow]NVIDIA_AV_FOG: {f} missing; rolling-shutter lookup disabled.[/bold yellow]"
+                )
+                return
+            arr = np.load(f).astype(np.float32)
+            if arr.ndim != 2:
+                raise ValueError(f"{f}: expected a 2-D table, got shape {arr.shape}")
+            K = self.K_per_cam[cam]
+            x0, y0, _, _ = K["crop"]
+            canvas_h, canvas_w = K["canvas_h"], K["canvas_w"]
+            # the table covers the canvas at `stride`, with the last sample clamped
+            exp_h = int(np.ceil(canvas_h / stride_doc))
+            exp_w = int(np.ceil(canvas_w / stride_doc))
+            if not (abs(arr.shape[0] - exp_h) <= 1 and abs(arr.shape[1] - exp_w) <= 1):
+                raise ValueError(
+                    f"{f}: table {arr.shape} does not cover a {canvas_h}x{canvas_w} canvas at "
+                    f"stride {stride_doc:g} (expected ~{exp_h}x{exp_w}). Refusing to sample it."
+                )
+            span = float(np.nanmax(arr) - np.nanmin(arr))
+            # Units guard. The tables overshoot the nominal +-shutter_delay/2 a little
+            # because rays near the canvas edge extrapolate past the source image, so the
+            # bound is loose; it exists to catch microseconds-instead-of-seconds, which
+            # would be off by 1e6.
+            limit = 2.0 * self.config.rolling_shutter_time if self.config.rolling_shutter_time > 0 else 0.1
+            if span > limit + 1e-6:
+                raise ValueError(
+                    f"{f}: readout times span {span * 1e3:.1f} ms, more than the {limit * 1e3:.1f} ms "
+                    f"bound implied by the published readout time. Wrong units?"
+                )
+            CONSOLE.log(
+                f"  rs_time_offset {cam:30s} {arr.shape} min/med/max = "
+                f"{np.nanmin(arr) * 1e3:+7.3f} / {np.nanmedian(arr) * 1e3:+7.3f} / "
+                f"{np.nanmax(arr) * 1e3:+7.3f} ms"
+            )
+            tables[slot] = torch.from_numpy(arr)
+            strides[slot] = stride_doc
+            offsets[slot] = (int(x0), int(y0))
+        outputs.cameras.metadata["rs_time_offset_lookup"] = RollingShutterLookup(tables, strides, offsets)
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG: rolling-shutter LOOKUP active for {len(tables)} cameras, stride "
+            f"{stride_doc:g}, crop-aware; it replaces the row-linear formula. A median near 0 ms "
+            f"above confirms the image timestamp is mid-readout (so time_to_center_pixel=0)."
+        )
+
+    # ----- Rectification version ---    # ----- Rectification version ----------------------------------------------------
+
+    def _select_rectification(self) -> None:
+        """Pick v1 or v2 and load the matching intrinsics.
+
+        v2 ships per-camera intrinsics and a ``safe_crop`` block::
+
+            "camera_front_wide_120fov": {
+              "fx": 942.66, "fy": 942.66, "cx": 1345.5, "cy": 1345.5, "w": 2692, "h": 1864,
+              "safe_crop": {"x": 0, "y": 351, "w": 2692, "h": 1338, "cx": 1345.5, "cy": 994.5}
+            }
+
+        The top-level ``w``/``h`` describe the FULL canvas, which still has black at the
+        lens-cone boundary. ``safe_crop`` is the largest rectangle with zero invalid
+        pixels; ``fx``/``fy`` are unchanged by the crop but ``cx``/``cy`` must come from
+        inside the block.
+        """
+        k2 = self.clip_root / "calib" / "K_rectified_v2.json"
+        has_v2 = k2.exists() and (self.clip_root / "images_rectv2").is_dir()
+        want = self.config.rectification
+        if want == "v2" and not has_v2:
+            raise FileNotFoundError(
+                f"rectification='v2' but {self.clip_root.name} has no v2 data "
+                f"({k2} / images_rectv2/). Only some clips have been re-rectified; use "
+                f"`--rectification auto` or `v1`."
+            )
+        use_v2 = has_v2 if want == "auto" else (want == "v2")
+
+        if use_v2:
+            self.rect_version = "v2"
+            self.images_dirname, self.masks_dirname = "images_rectv2", "masks_rectv2"
+            self.labels_2d_dirname = "labels_rectv2"
+            raw = json.loads(k2.read_text())
+        else:
+            self.rect_version = "v1"
+            self.images_dirname, self.masks_dirname = "images", "masks"
+            self.labels_2d_dirname = "labels"
+            raw = json.loads((self.clip_root / "calib" / "K_rectified.json").read_text())
+
+        self.K_per_cam = {}
+        for cam, K in raw.items():
+            entry = {"fx": float(K["fx"]), "fy": float(K["fy"]),
+                     "cx": float(K["cx"]), "cy": float(K["cy"]),
+                     "w": int(K["w"]), "h": int(K["h"]),
+                     # full canvas, before any crop -- the rs_time_offset tables live on it
+                     "canvas_w": int(K["w"]), "canvas_h": int(K["h"]),
+                     "crop": (0, 0, int(K["w"]), int(K["h"]))}
+            crop = K.get("safe_crop")
+            if self.rect_version == "v2" and self.config.apply_safe_crop:
+                if crop is None:
+                    raise ValueError(
+                        f"apply_safe_crop=True but {k2} has no safe_crop block for {cam}. "
+                        f"Pass `--apply-safe-crop False` to train on the full canvas (and keep "
+                        f"`--use-valid-masks True`, or the black corners enter the loss)."
+                    )
+                entry.update(cx=float(crop["cx"]), cy=float(crop["cy"]),
+                             w=int(crop["w"]), h=int(crop["h"]),
+                             crop=(int(crop["x"]), int(crop["y"]), int(crop["w"]), int(crop["h"])))
+            self.K_per_cam[cam] = entry
+
+        cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG rectification: {self.rect_version} "
+            f"(images {self.images_dirname}/, masks {self.masks_dirname}/, "
+            f"2-D labels {self.labels_2d_dirname}/, safe_crop="
+            f"{self.config.apply_safe_crop and self.rect_version == 'v2'})"
+        )
+        for cam in cams:
+            K = self.K_per_cam[cam]
+            CONSOLE.log(
+                f"  {cam:30s} {K['w']}x{K['h']}  fx={K['fx']:8.2f} cx={K['cx']:7.1f} cy={K['cy']:7.1f} "
+                f"({K['fx'] * np.pi / 180.0:.1f} px/deg on axis)"
+            )
+        self._warn_about_image_cache(cams)
+
+    def _warn_about_image_cache(self, cams: Tuple[str, ...]) -> None:
+        """v2 raises the resolution up to 2692x1880 (4.1x v1's pixels) and nerfstudio caches
+        every training image in RAM, so say the number out loud before it OOMs."""
+        px = sum(self.K_per_cam[c]["w"] * self.K_per_cam[c]["h"] for c in cams) * self.num_timesteps
+        gb_f32, gb_u8 = px * 3 * 4 / 1024**3, px * 3 / 1024**3
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG image cache (all {self.num_timesteps} timesteps x {len(cams)} cameras): "
+            f"{gb_f32:.1f} GB as float32, {gb_u8:.1f} GB as uint8; ~half that for a 50/50 split"
+        )
+        if gb_f32 / 2 > self.config.image_cache_warn_gb:
+            CONSOLE.print(
+                f"[bold yellow]NVIDIA_AV_FOG: the train split alone needs ~{gb_f32 / 2:.0f} GB of "
+                f"float32 image cache. Use `--pipeline.datamanager.cache-images-type uint8` "
+                f"(~{gb_u8 / 2:.0f} GB), `--pipeline.datamanager.cache-images cpu`, and/or "
+                f"`--pipeline.datamanager.camera-res-scale-factor 0.5` (4x less).[/bold yellow]"
+            )
+
+    # ----- Timing -----------------------------------------------------------------
+
+    def _spin_centers_us(self) -> np.ndarray:
+        """LiDAR spin-centre timestamp per timestep [T] (microseconds)."""
+        lt = self.clip_root / "calib" / "lidar_timestamps.parquet"
+        if lt.exists():
+            df = pd.read_parquet(lt)
+            if "spin_center_us" in df.columns:
+                sort_col = "sweep_idx" if "sweep_idx" in df.columns else df.columns[0]
+                df = df.sort_values(sort_col)
+                return df["spin_center_us"].to_numpy().astype(np.int64)
+        # T_rig_world.timestamp_us is the same quantity (the converter writes spin_center there).
+        return self.timestamps_us.astype(np.int64)
+
+    def _load_camera_timestamps(self) -> Dict[str, np.ndarray]:
+        """Per-camera capture timestamps, [T] microseconds, one entry per camera.
+
+        F1. The original implementation gave every camera the LiDAR spin-centre
+        timestamp. The cameras are in fact triggered in two groups (see
+        ``NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS``) whose offsets from the spin centre are
+        clip-specific. Measured medians (group A / group B):
+
+            NFF-01  +2.74 / -14.17 ms      NCF-01  +14.33 / -15.44 ms  (gap 29.77 ms)
+            NFF-07  +5.59 / -11.31 ms      NCF-03  +16.05 / +16.06 ms  (gap  0.01 ms)
+            NFF-14 +10.27 /  -9.16 ms      NCF-08   -0.28 /  -2.31 ms  (gap  2.04 ms)
+
+        Across all 32 clips the per-camera offset spans -15.75 .. +16.06 ms and the
+        inter-group gap 0.01 .. 29.77 ms. Converted with each clip's own ego speed, the
+        worst inter-group displacement is 65 cm (NFF-14: 19.43 ms at 120 km/h) and 57 cm
+        on NFF-01; it also propagates into dynamic-actor pose interpolation, which is
+        keyed on time.
+        """
+        cams = tuple(NVIDIA_AV_FOG_CAMERAS)
+        src = self.config.camera_timestamp_source
+        spin = self._spin_centers_us()
+
+        if src == "lidar":
+            CONSOLE.print(
+                "[bold red]NVIDIA_AV_FOG: camera_timestamp_source='lidar' -- every camera is being given the "
+                "LiDAR spin-centre timestamp. This is the PRE-FIX (defective) behaviour and is only here to "
+                "re-create superseded runs. The real per-camera offsets reach 16 ms on this dataset "
+                "(up to 29.8 ms between the two trigger groups, 65 cm of ego motion at highway speed)."
+                "[/bold red]"
+            )
+            return {c: spin.copy() for c in cams}
+
+        ts: Dict[str, np.ndarray] = {}
+        origin = "unknown"
+
+        cam_ts_path = self.clip_root / "calib" / "camera_timestamps.parquet"
+        if cam_ts_path.exists():
+            df = pd.read_parquet(cam_ts_path)
+            if "timestep_idx" in df.columns:
+                df = df.sort_values("timestep_idx").reset_index(drop=True)
+            missing = [c for c in cams if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    f"{cam_ts_path} exists but is missing camera column(s) {missing}. "
+                    f"Columns present: {list(df.columns)}"
+                )
+            if len(df) != self.num_timesteps:
+                raise ValueError(
+                    f"{cam_ts_path} has {len(df)} rows but the clip has {self.num_timesteps} timesteps."
+                )
+            ts = {c: df[c].to_numpy().astype(np.int64) for c in cams}
+            origin = "calib/camera_timestamps.parquet"
+        else:
+            video_dir = self.clip_root / "videos"
+            per_cam_files = {c: video_dir / f"{c}.timestamps.parquet" for c in cams}
+            if not all(f.exists() for f in per_cam_files.values()):
+                raise FileNotFoundError(
+                    "F1: real per-camera timestamps are required but were not found.\n"
+                    f"  looked for {cam_ts_path}\n"
+                    f"  and for    {video_dir}/<cam>.timestamps.parquet\n"
+                    "Re-run the dataset converter so one of them exists, or pass "
+                    "`--camera-timestamp-source lidar` to deliberately reproduce the superseded, "
+                    "defective behaviour (per-camera timing error up to 16 ms on this dataset)."
+                )
+            for c, f in per_cam_files.items():
+                col = pd.read_parquet(f)["timestamp"].to_numpy().astype(np.int64)
+                # Same frame-selection rule the converter used to pick the rectified frame:
+                # argmin |camera timestamp - lidar spin_center_us|.
+                idx = np.abs(col[None, :] - spin[:, None]).argmin(axis=1)
+                ts[c] = col[idx]
+            origin = "videos/<cam>.timestamps.parquet (nearest to spin centre)"
+
+        self._log_camera_timing(ts, spin, origin)
+        return ts
+
+    def _log_camera_timing(self, ts: Dict[str, np.ndarray], spin: np.ndarray, origin: str) -> None:
+        """Sanity-check block: per-camera offset vs the LiDAR spin centre, and the gap
+        between the two trigger groups. Also hard-fails on implausible offsets."""
+        frame_period_us = 33_331.0  # 30 Hz cameras; measured median inter-frame delta
+        CONSOLE.log(f"NVIDIA_AV_FOG camera timestamps: source = {origin}")
+        medians: Dict[str, float] = {}
+        for c in NVIDIA_AV_FOG_CAMERAS:
+            d = (ts[c].astype(np.float64) - spin.astype(np.float64)) / 1000.0  # ms
+            medians[c] = float(np.median(d))
+            CONSOLE.log(
+                f"  {c:30s} offset vs spin centre: median {medians[c]:+8.3f} ms, "
+                f"p05 {np.percentile(d, 5):+8.3f}, p95 {np.percentile(d, 95):+8.3f} ms"
+            )
+            if np.abs(d).max() > frame_period_us / 1000.0:
+                raise ValueError(
+                    f"Camera {c} timestamp is more than one frame period from the LiDAR spin centre "
+                    f"(max |offset| = {np.abs(d).max():.1f} ms). The timestamp source is probably on a "
+                    f"different clock than calib/lidar_timestamps.parquet -- refusing to guess."
+                )
+        ga = [medians[c] for c in NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS[0] if c in medians]
+        gb = [medians[c] for c in NVIDIA_AV_FOG_CAMERA_TRIGGER_GROUPS[1] if c in medians]
+        if ga and gb:
+            gap = abs(float(np.median(ga)) - float(np.median(gb)))
+            CONSOLE.log(
+                f"  trigger-group gap: {gap:.2f} ms "
+                f"(group A median {np.median(ga):+.2f}, group B median {np.median(gb):+.2f} ms) "
+                f"-- clip-specific; 0.01-29.77 ms across the 32 released clips"
+            )
+
+    def _apply_rolling_shutter_config(self) -> None:
+        """F2. Take the rolling-shutter readout time from the published calibration.
+
+        ``calib/camera_intrinsics_ftheta.json`` carries, per camera::
+
+            "shutter_type":    "ROLLING_TOP_TO_BOTTOM"
+            "shutter_delay_us": 30559
+
+        nerfstudio applies ``rolling_shutter_time`` to every camera uniformly, so we
+        require the seven cameras to agree (they do, in all 32 clips) rather than
+        silently averaging them.
+        """
+        if self.config.rolling_shutter_source == "config":
+            CONSOLE.print(
+                f"[bold yellow]NVIDIA_AV_FOG: rolling_shutter_source='config' -> "
+                f"rolling_shutter_time={self.config.rolling_shutter_time} s is being used verbatim and the "
+                f"published 0.030559 s readout is ignored.[/bold yellow]"
+            )
+            return
+
+        path = self.clip_root / "calib" / "camera_intrinsics_ftheta.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"rolling_shutter_source='calib' but {path} is missing. Pass "
+                f"`--rolling-shutter-source config --rolling-shutter-time 0.0` to deliberately "
+                f"treat the cameras as global-shutter (the superseded behaviour)."
+            )
+        ftheta = json.loads(path.read_text())
+        delays, types = {}, {}
+        for cam in NVIDIA_AV_FOG_CAMERAS:
+            if cam not in ftheta:
+                raise ValueError(f"{path} has no entry for {cam}")
+            delays[cam] = float(ftheta[cam]["shutter_delay_us"]) * 1e-6
+            types[cam] = str(ftheta[cam].get("shutter_type", "UNKNOWN"))
+
+        bad = {c: t for c, t in types.items() if t != "ROLLING_TOP_TO_BOTTOM"}
+        if bad:
+            raise ValueError(
+                f"Expected every camera to report shutter_type='ROLLING_TOP_TO_BOTTOM' "
+                f"(nerfstudio's TOP_TO_BOTTOM ray-time branch assumes it); got {bad}."
+            )
+        unique = sorted(set(round(v, 9) for v in delays.values()))
+        if len(unique) != 1:
+            raise ValueError(
+                f"Cameras disagree on shutter_delay_us ({delays}). nerfstudio applies one "
+                f"rolling_shutter_time to all cameras, so this needs a per-camera implementation "
+                f"rather than a silent average."
+            )
+        self.config.rolling_shutter_time = unique[0]
+        frame_period = 1.0 / 30.0
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG rolling shutter: TOP_TO_BOTTOM, readout {unique[0] * 1e3:.3f} ms "
+            f"({100.0 * unique[0] / frame_period:.1f}% of the 33.3 ms frame period); "
+            f"time_to_center_pixel = {self.config.time_to_center_pixel} s "
+            f"(0 = the image timestamp is the CENTRE of the frame, per "
+            f"calib/rs_time_offset/README.json: 'mid-frame readout')"
+        )
+
+    # ----- LiDAR frame --------------------------------------------------------------
+
+    def _resolve_lidar_frame(self) -> str:
+        """F3. Decide the frame of ``lidar/sweep_*.npy`` from the clip, not from a default.
+
+        ``provenance.json`` carries ``lidar_frame`` once the clip has been converted::
+
+            {"lidar_frame": "ego",
+             "lidar_frame_fix": {"ground_z_before_m": -1.96, "ground_z_after_m": 0.0, ...}}
+
+        Clips written before the fix have no marker and are in the SENSOR frame. Loading
+        one as "ego" applies inv(T_lidar_rig) a second time and drops the world-frame
+        ground to -1.94 m -- the error behind the superseded published numbers.
+        """
+        prov_path = self.clip_root / "provenance.json"
+        marker = None
+        if prov_path.exists():
+            try:
+                marker = json.loads(prov_path.read_text()).get("lidar_frame")
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{prov_path} is not valid JSON: {e}") from e
+        if marker is not None and marker not in ("ego", "sensor"):
+            raise ValueError(
+                f"{prov_path}: lidar_frame={marker!r} is not one of 'ego' / 'sensor'. "
+                f"Refusing to guess the LiDAR frame."
+            )
+
+        forced = self.config.lidar_points_frame
+        if forced != "auto":
+            if marker is not None and marker != forced:
+                CONSOLE.print(
+                    f"[bold yellow]NVIDIA_AV_FOG: lidar_points_frame='{forced}' OVERRIDES "
+                    f"provenance.lidar_frame='{marker}'. If that is not deliberate you are introducing a "
+                    f"{abs(float(self.T_lidar_rig[2, 3])):.2f} m vertical error.[/bold yellow]"
+                )
+            else:
+                CONSOLE.log(f"NVIDIA_AV_FOG LiDAR frame: '{forced}' (forced by config)")
+            frame = forced
+        elif marker is not None:
+            CONSOLE.log(f"NVIDIA_AV_FOG LiDAR frame: '{marker}' (from provenance.lidar_frame)")
+            frame = marker
+        elif self.config.allow_unmarked_lidar_frame:
+            CONSOLE.print(
+                "[bold red]NVIDIA_AV_FOG: this clip has no provenance.lidar_frame. "
+                "allow_unmarked_lidar_frame=True -> assuming the LEGACY SENSOR frame. "
+                "Verify against the ground-plane check below before trusting any metric.[/bold red]"
+            )
+            frame = "sensor"
+        else:
+            raise ValueError(
+                f"{prov_path} has no 'lidar_frame' marker, so the frame of lidar/sweep_*.npy is unknown.\n"
+                f"  This clip predates the frame fix and is almost certainly in the SENSOR frame.\n"
+                f"  Pass `--allow-unmarked-lidar-frame True` to accept that reading, or\n"
+                f"  `--lidar-points-frame {{ego,sensor}}` to state it outright.\n"
+                f"  Guessing costs {abs(float(self.T_lidar_rig[2, 3])):.2f} m of vertical offset."
+            )
+
+        if self.config.check_lidar_frame_geometry:
+            self._check_lidar_frame_geometry(frame)
+        return frame
+
+    def _check_lidar_frame_geometry(self, frame: str) -> None:
+        """Warn if the measured ground plane disagrees with the declared frame.
+
+        Ground z is estimated as the 10th percentile of z over points 6-20 m out, which is
+        robust to the ego vehicle and to nearby traffic but NOT to a strong road gradient --
+        hence a warning, never an error.
+        """
+        sweep_path = self.clip_root / "lidar" / "sweep_0000.npy"
+        if not sweep_path.exists():
+            return
+        sweep = np.load(sweep_path)
+        radius = np.hypot(sweep[:, 0], sweep[:, 1])
+        sel = sweep[(radius > 6.0) & (radius < 20.0), 2]
+        if sel.size < 1000:
+            return
+        ground_z = float(np.percentile(sel, 10))
+        mount_z = float(self.T_lidar_rig[2, 3])
+        err_declared = abs(ground_z - (0.0 if frame == "ego" else -mount_z))
+        err_other = abs(ground_z - (-mount_z if frame == "ego" else 0.0))
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG LiDAR frame check: ground z (p10, 6-20 m) = {ground_z:+.2f} m, "
+            f"lidar mount z = {mount_z:+.2f} m; expected ~"
+            f"{0.0 if frame == 'ego' else -mount_z:+.2f} m for frame='{frame}'"
+        )
+        if err_other + 1.0 < err_declared:
+            CONSOLE.print(
+                f"[bold red]NVIDIA_AV_FOG: the ground plane fits frame="
+                f"'{'sensor' if frame == 'ego' else 'ego'}' {err_declared - err_other:.2f} m better than the "
+                f"declared '{frame}'. Either provenance.lidar_frame is wrong or this clip is on a steep "
+                f"gradient. Check before trusting LiDAR metrics.[/bold red]"
+            )
 
     # ----- ADDataParser overrides -------------------------------------------------
 
     def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
         cams = tuple(NVIDIA_AV_FOG_CAMERAS) if "all" in self.config.cameras else tuple(self.config.cameras)
-        Rwrot = self._world_rotation  # 4x4
 
         intrinsics: List[np.ndarray] = []
         c2ws: List[np.ndarray] = []
@@ -267,9 +953,11 @@ class NvidiaAvFog(ADDataParser):
         timestep_record: List[int] = []
 
         for t in range(self.num_timesteps):
-            T_rig_world_t = Rwrot @ self.T_rig_world[t]  # 4x4
-            ts_seconds = float(self.timestamps_us[t]) * 1e-6
+            T_rig_world_t = self.T_rig_world[t]  # 4x4; the world frame is already ISO 8855
             for slot, cam_name in enumerate(cams):
+                # F1: the capture time is the CAMERA's own timestamp, not the LiDAR
+                # spin centre. See _load_camera_timestamps().
+                ts_seconds = float(self.camera_timestamps_us[cam_name][t]) * 1e-6
                 K_info = self.K_per_cam[cam_name]
                 K = np.array([
                     [K_info["fx"], 0.0,           K_info["cx"]],
@@ -288,12 +976,16 @@ class NvidiaAvFog(ADDataParser):
 
                 intrinsics.append(K)
                 c2ws.append(c2w)
+                # v2 + apply_safe_crop: w/h/cx/cy already describe the CROPPED image; the
+                # crop itself is handed to InputDataset via metadata["image_crops"].
                 widths.append(int(K_info["w"]))
                 heights.append(int(K_info["h"]))
                 times.append(ts_seconds)
                 sensor_idxs.append(slot)
                 timestep_record.append(t)
-                image_filenames.append(self.clip_root / "images" / cam_name / f"frame_{t:04d}.jpg")
+                image_filenames.append(
+                    self.clip_root / self.images_dirname / cam_name / f"frame_{t:04d}.jpg"
+                )
 
         intrinsics_t = torch.tensor(np.stack(intrinsics), dtype=torch.float32)
         c2ws_t = torch.tensor(np.stack(c2ws), dtype=torch.float32)
@@ -325,13 +1017,12 @@ class NvidiaAvFog(ADDataParser):
         return cameras, image_filenames
 
     def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
-        Rwrot = self._world_rotation
         # T_lidar_rig.json also stores T_rig_from_lidar (= lidar->rig); see camera comment above.
         # Translation (1.14, 0, 1.94) m = lidar position on rig (roof-mounted, forward of center).
         lidar_to_rig = self.T_lidar_rig
         poses, times, idxs, filenames, timestep_record = [], [], [], [], []
         for t in range(self.num_timesteps):
-            T_rig_world_t = Rwrot @ self.T_rig_world[t]
+            T_rig_world_t = self.T_rig_world[t]
             l2w = T_rig_world_t @ lidar_to_rig
             ts_seconds = float(self.timestamps_us[t]) * 1e-6
             poses.append(l2w)
@@ -343,36 +1034,87 @@ class NvidiaAvFog(ADDataParser):
         times_t = torch.tensor(times, dtype=torch.float64)
         idxs_t = torch.tensor(idxs, dtype=torch.int32).unsqueeze(-1)
         self._lidar_timestep = timestep_record
+        elevations, azimuths = self._load_beam_geometry()
         lidars = Lidars(
             lidar_to_worlds=poses_t[:, :3, :4],
-            lidar_type=LidarType.PANDAR64,  # closest enum; affects ray-drop only
+            # F6: a 128-beam sensor, declared as such. The old LidarType.PANDAR64 made the
+            # datamanager rasterise onto Pandar64's 64 static elevations.
+            lidar_type=LidarType.NCORE128 if elevations is not None else LidarType.VELODYNE128,
             times=times_t,
             metadata={
                 "sensor_idxs": idxs_t,
                 "timesteps": torch.tensor(timestep_record, dtype=torch.int32).unsqueeze(-1),
             },
-            horizontal_beam_divergence=HORIZONTAL_BEAM_DIVERGENCE,
-            vertical_beam_divergence=VERTICAL_BEAM_DIVERGENCE,
+            horizontal_beam_divergence=self.config.horizontal_beam_divergence,
+            vertical_beam_divergence=self.config.vertical_beam_divergence,
             valid_lidar_distance_threshold=DUMMY_DISTANCE_VALUE / 2,
+            elevations=elevations,
+            azimuths=azimuths,
         )
         return lidars, filenames
 
+    def _load_beam_geometry(self):
+        """F6. The sensor's real beam table from ``calib/lidar_intrinsics.json``.
+
+        Returns ``(elevations, azimuths)`` as [1, n, 1] tensors in radians, sorted
+        ascending (``ELEV_CHANNELS_PER_TILE`` tiling in SplatAD assumes monotone
+        elevations), or ``(None, None)`` when disabled or unavailable.
+        """
+        if not self.config.use_published_beam_geometry:
+            CONSOLE.print(
+                "[bold yellow]NVIDIA_AV_FOG: use_published_beam_geometry=False -> falling back to a "
+                "static 128-beam elevation table; ray-drop geometry will not match this vehicle."
+                "[/bold yellow]"
+            )
+            return None, None
+        path = self.clip_root / "calib" / "lidar_intrinsics.json"
+        if not path.exists():
+            CONSOLE.print(f"[bold yellow]NVIDIA_AV_FOG: {path} missing; using the static beam table.[/bold yellow]")
+            return None, None
+        spec = json.loads(path.read_text())
+        elev = np.asarray(spec["row_elevations_rad"], dtype=np.float64)
+        azim = np.asarray(spec["column_azimuths_rad"], dtype=np.float64)
+        n_rows, n_cols = int(spec.get("n_rows", len(elev))), int(spec.get("n_columns", len(azim)))
+        if len(elev) != n_rows or len(azim) != n_cols:
+            raise ValueError(
+                f"{path}: n_rows/n_columns ({n_rows}/{n_cols}) disagree with "
+                f"row_elevations_rad/column_azimuths_rad ({len(elev)}/{len(azim)})."
+            )
+        self.lidar_n_rows, self.lidar_n_cols = n_rows, n_cols
+        self.lidar_row_elevations = elev  # unsorted, in sensor row order (= ring_id)
+        self.lidar_col_azimuths = azim
+        elev_sorted = np.sort(elev)
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG lidar: {n_rows} beams x {n_cols} columns, elevation "
+            f"{np.rad2deg(elev_sorted[0]):+.2f}..{np.rad2deg(elev_sorted[-1]):+.2f} deg, "
+            f"azimuth step {np.rad2deg(np.abs(np.median(np.diff(azim)))):.4f} deg, "
+            f"beam divergence h/v {self.config.horizontal_beam_divergence:.1e}/"
+            f"{self.config.vertical_beam_divergence:.1e} rad (ASSUMED, not published)"
+        )
+        elevations = torch.tensor(elev_sorted, dtype=torch.float32).view(1, -1, 1)
+        azimuths = torch.tensor(azim, dtype=torch.float32).view(1, -1, 1)
+        return elevations, azimuths
+
     def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[torch.Tensor]:
         """Returns one [N, 5] tensor per lidar frame: x, y, z, intensity, t_offset (sec).
-        Points are already in ego (== sensor==ego since lidar≈rig) frame on disk, so
-        no world->sensor transform is needed — but we still apply T_lidar_rig to express
-        them in the actual lidar-sensor frame the ADDataParser expects.
+
+        ADDataParser wants the points in the LIDAR SENSOR frame (``lidar_to_worlds``
+        already contains ``T_lidar_rig``). So:
+          * ``self.lidar_frame == "sensor"`` -> the points are already there, use as-is;
+          * ``self.lidar_frame == "ego"``    -> map ego -> sensor with inv(T_lidar_rig).
+        The frame comes from ``provenance.lidar_frame`` (F3), not from a config default.
         """
         # self.T_lidar_rig is T_rig_from_lidar (lidar->rig); invert to get rig->lidar so we can
         # transform sweep points from ego(=rig) frame into actual lidar-sensor frame.
-        if self.config.lidar_points_frame == "sensor":
+        if self.lidar_frame == "sensor":
             Rrig = torch.eye(3); trig = torch.zeros(3)  # points already in the lidar-sensor frame
         else:
             T_lid_from_rig = torch.tensor(np.linalg.inv(self.T_lidar_rig), dtype=torch.float64)
             Rrig = T_lid_from_rig[:3, :3].float()
             trig = T_lid_from_rig[:3, 3].float()
         point_clouds = []
-        for f in filenames:
+        n_dropped_rays = 0
+        for t, f in enumerate(filenames):
             sweep = np.load(f)  # [N, 6] float32
             xyz_ego = torch.from_numpy(sweep[:, 0:3]).float()
             # Ego -> lidar-sensor frame (lidar_to_rig = identity-ish but be safe).
@@ -382,11 +1124,87 @@ class NvidiaAvFog(ADDataParser):
                 sweep[:, LIDAR_SWEEP_COL_T_OFFSET_US:LIDAR_SWEEP_COL_T_OFFSET_US + 1].astype(np.float32) * 1e-6
             )
             pc = torch.cat([xyz_sensor, intensity, t_offset_s], dim=-1)  # [N, 5]
+            missing = self._nonreturn_points(t)
+            if missing is not None:
+                n_dropped_rays += missing.shape[0]
+                pc = torch.cat([pc, missing], dim=0)
             point_clouds.append(pc)
         # ADDataParser._adjust_times will rebase pc[:, 4] -= 0 if the column is already
         # an offset (which it is — relative to sweep center). Nothing else to do.
+        if n_dropped_rays:
+            total = sum(pc.shape[0] for pc in point_clouds)
+            CONSOLE.log(
+                f"NVIDIA_AV_FOG ray-drop: added {n_dropped_rays} non-return rays from "
+                f"lidar/range_image/ ({100.0 * n_dropped_rays / max(total, 1):.1f}% of all rays), "
+                f"at the DUMMY_DISTANCE_VALUE={DUMMY_DISTANCE_VALUE} m marker"
+            )
         lidars.lidar_to_worlds = lidars.lidar_to_worlds.float()
         return point_clouds
+
+    def _range_image_path(self, t: int) -> "Path | None":
+        d = self.clip_root / "lidar" / "range_image"
+        if not d.is_dir():
+            return None
+        for name in (f"sweep_{t:04d}.npy", f"frame_{t:04d}.npy", f"range_{t:04d}.npy", f"{t:04d}.npy"):
+            p = d / name
+            if p.exists():
+                return p
+        return None
+
+    def _nonreturn_points(self, t: int) -> "torch.Tensor | None":
+        """F6. Rays that did not return, read from the published range image.
+
+        ``lidar/range_image/<t>.npy`` is a [n_rows, n_cols] = [128, 3600] range image in
+        metres in which non-returns are marked explicitly. NeuRAD represents a non-return
+        as a point at ``DUMMY_DISTANCE_VALUE`` (2000 m) along the ray, which is what
+        ``add_missing_points`` synthesises from the beam grid; with a real range image we
+        can emit exactly the rays that actually dropped instead of inferring them.
+
+        ASSUMPTIONS, to re-check when the files land (the directory does not exist in any
+        clip yet -- this path is inactive until it does):
+          * a cell is a non-return iff its value is non-finite or <= 0;
+          * row index == beam index == the sweep's ``ring_id``, so row r has elevation
+            ``row_elevations_rad[r]``; column index c has azimuth ``column_azimuths_rad[c]``;
+          * per-point time is ``(c / n_cols - 0.5) * revolution_time``, i.e. column 0 is
+            read half a revolution before the spin centre. ``row_azimuth_offsets_rad``
+            (max ~0.038 rad = 0.6 us of spin) is NOT applied.
+        The shape is asserted against ``calib/lidar_intrinsics.json``; a mismatch raises.
+        """
+        if not self.config.use_range_image_raydrop:
+            return None
+        path = self._range_image_path(t)
+        if path is None:
+            return None
+        if self.lidar_row_elevations.size == 0:
+            raise ValueError(
+                "use_range_image_raydrop=True needs the beam table from "
+                "calib/lidar_intrinsics.json, but use_published_beam_geometry is off or the file "
+                "is missing."
+            )
+        rng = np.load(path)
+        if rng.ndim == 3:  # [rows, cols, channels] -> range channel
+            rng = rng[..., 0]
+        if rng.shape != (self.lidar_n_rows, self.lidar_n_cols):
+            raise ValueError(
+                f"{path} has shape {rng.shape}, expected "
+                f"({self.lidar_n_rows}, {self.lidar_n_cols}) from calib/lidar_intrinsics.json."
+            )
+        miss = ~np.isfinite(rng) | (rng <= 0)
+        rows, cols = np.nonzero(miss)
+        if rows.size == 0:
+            return None
+        elev = self.lidar_row_elevations[rows]
+        azim = self.lidar_col_azimuths[cols]
+        d = float(DUMMY_DISTANCE_VALUE)
+        xyz = np.stack(
+            [d * np.cos(elev) * np.cos(azim), d * np.cos(elev) * np.sin(azim), d * np.sin(elev)], axis=-1
+        ).astype(np.float32)
+        revolution_time = 1.0 / 10.0  # spinning_frequency_hz = 10.0
+        t_off = ((cols.astype(np.float32) / self.lidar_n_cols) - 0.5) * revolution_time
+        extra = np.concatenate(
+            [xyz, np.zeros((rows.size, 1), np.float32), t_off.astype(np.float32)[:, None]], axis=-1
+        )
+        return torch.from_numpy(extra)
 
     def _get_actor_trajectories(self) -> List[Dict]:
         """Read obstacles_3d_world.parquet and emit per-track trajectories.
@@ -400,18 +1218,14 @@ class NvidiaAvFog(ADDataParser):
         df = pd.read_parquet(df_path)
         if not len(df):
             return []
-        Rwrot = self._world_rotation[:3, :3]
-        twrot = self._world_rotation[:3, 3]
-
-        allowed = set(NVIDIA_AV_FOG_ALLOWED_RIGID_CLASSES)
-        if self.config.include_deformable_actors:
-            allowed |= set(NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES)
-        df = df[df["label_class"].str.lower().isin(allowed)]
+        df = df.assign(label_class=df["label_class"].str.lower())
+        df = self._filter_actor_classes(df)
         if not len(df):
             return []
 
         ts_seconds = self.timestamps_us.astype(np.float64) * 1e-6
         trajectories: List[Dict] = []
+        n_stationary = 0
         for track_id, g in df.groupby("track_id"):
             g = g.sort_values("timestep_idx")
             ti = g["timestep_idx"].to_numpy().astype(np.int64)
@@ -426,15 +1240,15 @@ class NvidiaAvFog(ADDataParser):
             sy = g["size_y"].to_numpy().astype(np.float32).max()  # width
             sz = g["size_z"].to_numpy().astype(np.float32).max()  # height
             n = len(ti)
+            peak_speed = _track_peak_speed(g, cx, cy, ts_seconds[ti])
+            stationary = bool(peak_speed < self.config.stationary_speed_threshold)
+            n_stationary += int(stationary)
 
             poses = np.tile(np.eye(4)[None, :, :], (n, 1, 1)).astype(np.float64)
             for i in range(n):
-                R = _quat_to_R(qx[i], qy[i], qz[i], qw[i])
-                # Apply world rotation: p_iso = Rwrot @ p_ncore
-                R_world = Rwrot @ R
-                t_world = Rwrot @ np.array([cx[i], cy[i], cz[i]]) + twrot
-                poses[i, :3, :3] = R_world
-                poses[i, :3, 3] = t_world
+                # obstacles_3d_world is already expressed in the (ISO 8855) world frame.
+                poses[i, :3, :3] = _quat_to_R(qx[i], qy[i], qz[i], qw[i])
+                poses[i, :3, 3] = np.array([cx[i], cy[i], cz[i]])
 
             timestamps_s = ts_seconds[ti]
             # dims: PandaSet convention is (width, length, height). NCore stores (size_x=length,
@@ -442,18 +1256,76 @@ class NvidiaAvFog(ADDataParser):
             dims = np.array([sy, sx, sz], dtype=np.float32)
 
             label = str(g["label_class"].iloc[0])
-            is_pedestrian = label in NVIDIA_AV_FOG_ALLOWED_DEFORMABLE_CLASSES
+            deformable = label in NVIDIA_AV_FOG_DEFORMABLE_CLASSES
+            symmetric = label in NVIDIA_AV_FOG_RIGID_CLASSES
 
             trajectories.append({
                 "poses": torch.from_numpy(poses).float(),
                 "timestamps": torch.from_numpy(timestamps_s),
                 "dims": torch.from_numpy(dims),
                 "label": label,
-                "stationary": False,
-                "symmetric": not is_pedestrian,
-                "deformable": is_pedestrian,
+                "stationary": stationary,
+                "symmetric": symmetric,
+                "deformable": deformable,
             })
+        CONSOLE.log(
+            f"NVIDIA_AV_FOG actors: {len(trajectories)} tracks, {n_stationary} stationary "
+            f"(peak speed < {self.config.stationary_speed_threshold} m/s), "
+            f"{sum(t['deformable'] for t in trajectories)} deformable"
+        )
         return trajectories
+
+    def _filter_actor_classes(self, df: pd.DataFrame) -> pd.DataFrame:
+        """F4. Keep the actor classes we model, and account for every box we do not.
+
+        Prints a per-class table (count, category, kept/dropped) so a class can never go
+        missing without it showing up in the log.
+        """
+        counts = df["label_class"].value_counts().to_dict()
+        unknown = {c: n for c, n in counts.items() if c not in NVIDIA_AV_FOG_KNOWN_CLASSES}
+        if unknown:
+            msg = (
+                f"Unknown obstacle class(es) in {self.clip_root.name}: "
+                + ", ".join(f"{c} ({n} boxes)" for c, n in sorted(unknown.items(), key=lambda kv: -kv[1]))
+                + ". Add them to NVIDIA_AV_FOG_RIGID_CLASSES / _DEFORMABLE_CLASSES / "
+                "_STATIC_OBJECT_CLASSES, or pass `--unknown-class-policy warn|drop`."
+            )
+            if self.config.unknown_class_policy == "error":
+                raise ValueError(msg)
+            if self.config.unknown_class_policy == "warn":
+                CONSOLE.print(f"[bold red]NVIDIA_AV_FOG: {msg}[/bold red]")
+
+        allowed = set(NVIDIA_AV_FOG_RIGID_CLASSES) | set(NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES)
+        if self.config.include_deformable_actors:
+            allowed |= set(NVIDIA_AV_FOG_DEFORMABLE_CLASSES)
+        if self.config.include_static_object_actors:
+            allowed |= set(NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES)
+
+        def category(c: str) -> str:
+            if c in NVIDIA_AV_FOG_RIGID_CLASSES:
+                return "rigid"
+            if c in NVIDIA_AV_FOG_RIGID_ASYMMETRIC_CLASSES:
+                return "rigid (asym)"
+            if c in NVIDIA_AV_FOG_DEFORMABLE_CLASSES:
+                return "deformable"
+            if c in NVIDIA_AV_FOG_STATIC_OBJECT_CLASSES:
+                return "static object"
+            return "UNKNOWN"
+
+        kept = dropped = 0
+        CONSOLE.log(f"NVIDIA_AV_FOG actor classes in {self.clip_root.name}:")
+        for c, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            keep = c in allowed
+            kept += n if keep else 0
+            dropped += 0 if keep else n
+            CONSOLE.log(f"  {c:20s} {n:7d} boxes  {category(c):14s} {'KEPT' if keep else 'dropped'}")
+        total = kept + dropped
+        CONSOLE.log(
+            f"  -> {kept}/{total} boxes kept ({100.0 * kept / max(total, 1):.1f}%), "
+            f"include_deformable_actors={self.config.include_deformable_actors}, "
+            f"include_static_object_actors={self.config.include_static_object_actors}"
+        )
+        return df[df["label_class"].isin(allowed)]
 
     # ----- Split override --------------------------------------------------------
 
@@ -495,6 +1367,26 @@ def _list_to_4x4(rows: List[List[float]]) -> np.ndarray:
     raise ValueError(f"Expected 3x4 or 4x4 matrix, got {arr.shape}")
 
 
+def _track_peak_speed(g: pd.DataFrame, cx: np.ndarray, cy: np.ndarray, times_s: np.ndarray) -> float:
+    """F5. Peak ground-plane speed of one track, m/s.
+
+    Prefers the published `velocity_x_mps` / `velocity_y_mps` columns; falls back to
+    finite-differencing the box centres when they are absent (older label dumps). A
+    single-sample track has no measurable motion and returns 0.0, i.e. stationary.
+    """
+    if "velocity_x_mps" in g.columns and "velocity_y_mps" in g.columns:
+        vx = g["velocity_x_mps"].to_numpy(dtype=np.float64)
+        vy = g["velocity_y_mps"].to_numpy(dtype=np.float64)
+        speed = np.hypot(vx, vy)
+        if np.isfinite(speed).any():
+            return float(np.nanmax(speed))
+    if len(cx) < 2:
+        return 0.0
+    dt = np.diff(times_s)
+    dt[dt == 0] = np.inf  # duplicate timestamps -> ignore that interval
+    return float(np.max(np.hypot(np.diff(cx), np.diff(cy)) / dt))
+
+
 def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     """Quaternion (x, y, z, w) -> 3x3 rotation matrix."""
     n = qx * qx + qy * qy + qz * qz + qw * qw
@@ -510,31 +1402,77 @@ def _quat_to_R(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
 
 
 def _resolve_clip_root(data_root: Path, sequence: str) -> Path:
-    """Find <data_root>/processed/<clip_prefix><sequence>...<rest>/processed_pinhole.
+    """Locate a clip directory under ``data_root``, supporting both on-disk layouts.
 
-    Matches either by leading 3-digit prefix (``002``) or by uuid prefix (``b9ea7a9d``).
+    Live layout (what the dataset actually ships today)::
+
+        <data_root>/clips/NFF-01__b9ea7a9d/{images,lidar,labels,calib,videos,splits,...}
+
+    ``data_root`` may also be the parent that holds several subsets, in which case both
+    ``NVIDIA_FOGGY_Field/clips`` and ``NVIDIA_CLEAR_Field/clips`` are searched::
+
+        <data_root>/NVIDIA_FOGGY_Field/clips/NFF-01__b9ea7a9d/
+
+    Legacy layout (kept working; it is what the published runs used)::
+
+        <data_root>/processed/002_<uuid>_fog_day_rural/processed_pinhole/
+
+    ``sequence`` matches, in order of preference: the exact directory name, the clip id
+    before ``__`` (``NFF-01``), the hash after ``__`` (``b9ea7a9d``), or -- legacy only --
+    a leading 3-digit prefix (``002``). An ambiguous match is an error, never a guess.
     """
+    roots: List[Path] = []
+    if (data_root / "clips").is_dir():
+        roots.append(data_root / "clips")
+    for subset in ("NVIDIA_FOGGY_Field", "NVIDIA_CLEAR_Field"):
+        if (data_root / subset / "clips").is_dir():
+            roots.append(data_root / subset / "clips")
+
+    candidates: List[Path] = []
+    for root in roots:
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            name = child.name
+            clip_id, _, clip_hash = name.partition("__")
+            if sequence in (name, clip_id, clip_hash) or clip_id.lower() == sequence.lower():
+                candidates.append(child)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Sequence '{sequence}' matches multiple clips: {[str(c) for c in candidates]}. "
+            "Use the full directory name."
+        )
+    if roots:
+        available = sorted(c.name for root in roots for c in root.iterdir() if c.is_dir())
+        if not (data_root / "processed").exists():
+            raise ValueError(f"Sequence '{sequence}' not found under {[str(r) for r in roots]}. Available: {available}")
+
+    # ---- legacy processed/<clip>/processed_pinhole/ layout ----
     processed = data_root / "processed"
     if not processed.exists():
-        raise FileNotFoundError(f"No 'processed/' dir under {data_root}")
-    candidates = []
+        raise FileNotFoundError(
+            f"{data_root} has neither a 'clips/' directory (live layout) nor a 'processed/' "
+            f"directory (legacy layout)."
+        )
+    legacy = []
     for child in sorted(processed.iterdir()):
         if not child.is_dir():
             continue
-        name = child.name
-        if name.startswith(f"{sequence}_") or sequence in name:
-            candidates.append(child)
-    if not candidates:
+        if child.name.startswith(f"{sequence}_") or sequence in child.name:
+            legacy.append(child)
+    if not legacy:
         raise ValueError(
             f"Sequence '{sequence}' not found under {processed}. "
             f"Available: {[c.name for c in sorted(processed.iterdir()) if c.is_dir()]}"
         )
-    if len(candidates) > 1:
+    if len(legacy) > 1:
         raise ValueError(
-            f"Sequence '{sequence}' matches multiple clips: {[c.name for c in candidates]}. "
-            f"Use a longer/more specific prefix."
+            f"Sequence '{sequence}' matches multiple clips: {[c.name for c in legacy]}. "
+            "Use a longer/more specific prefix."
         )
-    clip = candidates[0] / "processed_pinhole"
+    clip = legacy[0] / "processed_pinhole"
     if not clip.exists():
-        raise FileNotFoundError(f"No processed_pinhole/ under {candidates[0]}")
+        raise FileNotFoundError(f"No processed_pinhole/ under {legacy[0]}")
     return clip
