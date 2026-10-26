@@ -1,0 +1,30 @@
+{
+ "config": "/capstor/scratch/cscs/yitiwang/foggyfields/p3/V0/neurad-foggy/safe/NFF-15/neurad-foggy_safe_NFF-15/neurad-foggy/2026-10-26_145157/config.yml",
+ "step": 29999,
+ "medium": false,
+ "fitted": {},
+ "rgb_ray_medium_on": null,
+ "rgb_ray_medium_off": {
+  "psnr": 26.679661017163117,
+  "ssim": 0.8441978966196378,
+  "lpips": 0.24107128816346327
+ },
+ "dark_channel_beta_medium_off": 0.02222562301903963,
+ "lidar": {
+  "n_rays": 6023597,
+  "median_err": 0.3870429992675781,
+  "frac_gt1m": 0.3044617692717491,
+  "frac_gt5m": 0.1156772274107979,
+  "intensity_rmse": 0.056683477030654045,
+  "false_near_mass": 0.004041589179783029,
+  "gt1m_0-10": 0.16993503137855787,
+  "gt5m_0-10": 0.04398414034485949,
+  "gt1m_10-30": 0.2526456437650536,
+  "gt5m_10-30": 0.08180743385940163,
+  "gt1m_30-60": 0.4685893603586083,
+  "gt5m_30-60": 0.1909240278287983,
+  "gt1m_60-120": 0.6320270331672857,
+  "gt5m_60-120": 0.3466912828557968
+ },
+ "notes": "rgb at ray res (center-pixel GT); lidar depth is medium-independent (geometry); dark-channel residual beta: clear-method floor is 0.0077"
+}

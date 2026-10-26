@@ -1,0 +1,10 @@
+{
+ "config": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_fix/neurad/safe/NCF-02/neurad_safe_NCF-02/neurad/2026-10-25_044149/config.yml",
+ "step": 29999,
+ "tag": "clear_NCF-02",
+ "n_rays": 455250,
+ "beta_freespace_median": 0.0032767043448984623,
+ "beta_freespace_mean": 0.0055607459507882595,
+ "beta_p25": 0.0007998492947081104,
+ "beta_p75": 0.007951561827212572
+}

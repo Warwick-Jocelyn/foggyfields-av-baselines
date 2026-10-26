@@ -325,3 +325,42 @@ VALIDATE ROUND 3 (NO-GO -> fixed): BENCH_* vs OUT_ROOT env names (would have POL
  fp16 searchsorted cast, SEED env-name collision with lane.sh's random seed (caught by the
  first smoke attempt's tyro error).
 Smoke v2 in flight (job 3754432): 500-iter compressed V1 schedule on NFF-15.
+
+---
+A8 (advisor insight test): WHERE does a fog-trained NeuRAD put the fog?
+ Free-space extinction read from the model's own pre-surface transmittance
+ (beta_hat = -ln(T_pre_surface)/s_surface, camera rays with far surfaces):
+   clear NCF-02 ckpt: median 0.0033 (method floor) | fog NFF-15 ckpt: 0.0028 -> NO DIFFERENCE.
+ CONCLUSION: the baked fog is NOT in free-space density (SDF-alpha suppresses diffuse density);
+ it lives in surface APPEARANCE (features/CNN render hazy surface colours). Consequences:
+ (1) the advisor's "beta is already in the NeRF" does not hold for NeuRAD's camera path - no
+ GT-free density anchor from camera free space; (2) explains the V1 mid-run collapse (6k
+ anchored steps must un-learn APPEARANCE haze, not density; on release the appearance
+ re-absorbs instantly); (3) supports V2 (fresh + anchored) as the method: prevention beats
+ un-baking. Mid-run evidence: V1 beta 0.0321(pinned)->0.0019 after release; V2 released at
+ 12k holding ~0.020; V3 no-anchor control collapsed to 0.0003.
+ADVISOR REGULARIZERS registered for the next refinement round (R1/R2, NOT launched - user
+ reviewing results first): R1 = TV smoothness on beta(x)/beta(t) (medium is low-frequency);
+ R2 = scene-alpha bimodality/entropy prior (objects are vacant-or-solid; semi-transparent
+ mist-geometry suppressed) - makes "fog unrepresentable in the scene" a loss, aimed exactly
+ at the V1/V3 collapse mode.
+
+---
+P3 ROUND 1 RESULTS (V0-V3, NFF-15, jobs 3754691 + evals)
+beta trajectories (p3/beta_trajectories.json): V1 pinned 0.0321 -> collapses to 0.0019 within
+ 3k of release; V2 pinned to 12k -> settles 0.0203 and holds through 18k alternation steps;
+ V3 free-from-start -> 0.0003 by 9k (negative control as designed).
+| variant | beta_final | rgb_ray on | rgb_ray off | dark-beta(medium-off) | lidar med / >1m / 0-10m>5m | notes |
+| V0 ref  |   -    | - | 26.68/.844/.241 | 0.0222 | 0.387 / .304 / .044 | fresh, no medium: STRONG ray-res ref; fog in appearance |
+| V1 seed |0.0019  | 24.25/.773/.429 | 24.96/.763/.441 | 0.0219 | 0.263 / .271 / .042 | collapse: appearance-baked fog wins (A8 explains) |
+| V2 fresh|0.0203  | 18.15/.712/.626 | 14.72/.553/.776 | -0.0042 | 1.453 / .611 / .070 | SEPARATION ACHIEVED (scene optically clean) but quality collapsed; theta exploded 3.57, g 2.41, intRMSE 0.127 |
+| V3 ctrl |0.0003  | 24.78/.764/.440 | 24.86/.762/.442 | 0.0217 | 0.261 / .271 / .042 | control: == V1-no-anchor |
+DIAGNOSIS: the in-loop mixture losses destabilise JOINT training (they were calibrated on
+ frozen scenes in P2): free theta inflates to 3.57 (drop NLL trivially satisfied), gain drifts
+ 2.4, intensity branch degrades, geometry follows. The separation mechanism itself is proven
+ (first real-data scene/fog decomposition: G3+G4 pass on V2).
+ROUND 2 (launched): V2b = V2 schedule, mixture OFF (attenuation + trusted heuristic only)
+ + R2 alpha-bimodality 1e-3; V2c = mixture ON with eta/theta/gain PINNED at P2 calibration
+ (freeze from step 1); V2b seeds s1/s2 (G1 needs seed std). A8 finding stands: fog ckpt's
+ free-space extinction == clear floor -> baked fog is in APPEARANCE, un-baking is the hard
+ path (V1), prevention is the method (V2 family).

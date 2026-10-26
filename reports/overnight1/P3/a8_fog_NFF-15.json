@@ -1,0 +1,10 @@
+{
+ "config": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_fix/neurad/safe/NFF-15/neurad_safe_NFF-15/neurad/2026-10-25_044235/config.yml",
+ "step": 29999,
+ "tag": "fog_NFF-15",
+ "n_rays": 272321,
+ "beta_freespace_median": 0.0028108072001487017,
+ "beta_freespace_mean": 0.005276224110275507,
+ "beta_p25": 0.0005199582665227354,
+ "beta_p75": 0.007389544043689966
+}
