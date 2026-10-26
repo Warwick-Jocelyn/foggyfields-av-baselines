@@ -63,6 +63,8 @@ class MediumLUT:
         squeeze = s.dim() == 1
         sq = s[:, None] if squeeze else s
         e, t = self.edges, self.tau
+        if sq.dtype != e.dtype:  # autocast fp16 queries against fp32 edges
+            sq = sq.to(e.dtype)
         if sq.shape[0] != t.shape[0]:
             raise ValueError(f"s has {sq.shape[0]} rays but the LUT has {t.shape[0]}")
         idx = torch.searchsorted(e, sq.detach().clamp(min=0.0).contiguous(), right=True).clamp(1, len(e) - 1)

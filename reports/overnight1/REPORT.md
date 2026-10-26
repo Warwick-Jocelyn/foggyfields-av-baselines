@@ -296,3 +296,32 @@ T11 FINAL (job 3754213) — beta(t) RAMP RECOVERY: GATE PASSED, ALL THREE MODES
  piecewise-linear curve, max rel err (t>=0.3): camera 6.1%, lidar 16.8%, joint 16.4%.
  P2 is now COMPLETE: homogeneous beta (two simulators), temporal beta(t), airlight, all
  controls (zero-fog, self-consistent, mismatched-sim, LISA convention isolation).
+
+---
+P3 IMPLEMENTATION (2026-10-26 afternoon) — joint {scene, medium} inversion on real fog
+Plan agent design (logged decisions): schedule INVERTS §6's literal warm start — "beta anchored
+ (camera-anchor 0.0321), scene adapts" — because B1-lite proved "scene frozen, fit beta" is
+ degenerate on a fog-trained init. Phases: A anchored warm-up -> B release -> C alternating
+ bounded blocks (+ soft log-space beta drift penalty). RGB supervision moved to the per-sample
+ head (rgb_ray) at ray res; CNN unsupervised during medium fitting (§11); competitive CNN rgb
+ deferred to a frozen-medium phase D (P4). Negative control V3 (no anchor) documents the
+ counterfactual.
+Implemented (neurad-studio, behind flags; B0 bit-identity re-verified by the validate agent):
+ MediumConfig schedule fields + BEFORE_TRAIN_ITERATION phase callback (requires_grad toggling,
+ resume-safe); loss.rgb_supervision="rgb_ray"; trusted-return mask (calibrated s_halo=6 m,
+ ground_tol=1.5 m: clear retention 99.25%, A2 class-(a) capture 59.6%) gating depth/prop-depth/
+ carving/prop-carving/intensity; in-loop FogReturnMixture (NLL + below-horizon drop NLL +
+ T10d log-intensity residual), medium-estimation-only (scene quantities DETACHED - the NLL
+ gradient into depth is unbounded, ~60/ray at 5 m error); quantile over informative rows;
+ "neurad-foggy" method config (+rgb_head/medium optimizer groups); checkpoint surgery
+ (p3_seed_ckpt.py; injects head + medium params incl. the shared-module duplicate key;
+ deletes optimizer states -> scene groups re-warm, logged); lane.sh SEED_CKPT hook +
+ neurad-foggy in the SIG hash.
+VALIDATE ROUND 3 (NO-GO -> fixed): BENCH_* vs OUT_ROOT env names (would have POLLUTED the
+ published bench results dir), missing shared-module ckpt key (strict-load crash), trainer
+ KeyError on deleted optimizers (--load-optimizer False), seed hook unreachable inside the
+ sig_ok guard, FOGGY_EXTRA absent from the run signature (stamp reuse across configs),
+ alternation re-enabling frozen eta/theta/beta0_learnable, quantile dilution/NaN risk,
+ fp16 searchsorted cast, SEED env-name collision with lane.sh's random seed (caught by the
+ first smoke attempt's tyro error).
+Smoke v2 in flight (job 3754432): 500-iter compressed V1 schedule on NFF-15.
