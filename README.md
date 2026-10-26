@@ -163,3 +163,15 @@ SplatAD/NeuRAD are unaffected and final.
 - Always `export PYTHONNOUSERSITE=1` (user-site numpy shadows the env otherwise).
 
 See [`RESULTS.md`](RESULTS.md) for the full reproduction notes and per-clip numbers.
+
+## FoggyFields medium (overnight-1, 2026-10-26)
+
+`src/foggyfields/` — the explicit fog medium: `MediumIntegrator` (plan v2 §5.2: non-uniform
+marching → per-ray tau LUT, differentiable interpolation) and the B1-lite transport
+(expected-depth overlay, exact ordered airlight with wall occlusion, surface-echo attenuation).
+Backbone-agnostic (NeuRAD ray bundles and SplatAD per-pixel rays). Tests: `tests/test_medium.py`
+(run inside the NGC container; 8 tests incl. zero-fog bit-for-bit reduction).
+
+`reports/overnight1/` — P0-subset audit answers, locked split, A1 fog-halo stats, A2 NeuRAD
+tail decomposition, A4 beta anchors (LiDAR-intensity route provably censored on this sensor;
+camera Koschmieder anchor: NFF-15 beta=0.025), B1-lite scripts and REPORT.md.

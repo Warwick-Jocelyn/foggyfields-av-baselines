@@ -1,0 +1,56 @@
+{
+ "locked": "2026-10-26",
+ "task": "FoggyFields overnight1",
+ "definition": "per-clip frame split = the shipped splits/nvs_50_50.json (train = even timesteps, eval = odd timesteps, 10 Hz, 199 frames). All 7 cameras and the LiDAR follow the same timestep split (nvidia_av_fog_dataparser._load_split_indices).",
+ "held_out_camera_views": "NOT AVAILABLE: the dataparser has no mechanism to hold a camera out of training while evaluating it (audit Q1). Adding one is a split change -> Jocelyn.",
+ "clips": {
+  "NCF-02": {
+   "clip_dir": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/data_all/clips/NCF-02__02805273",
+   "split_file": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/data_all/clips/NCF-02__02805273/splits/nvs_50_50.json",
+   "md5": "8bc7218d375c4fed1b87cebdd2150963",
+   "n_train": 100,
+   "n_eval": 99,
+   "train_first_last": [
+    0,
+    198
+   ],
+   "eval_first_last": [
+    1,
+    197
+   ],
+   "role": "clear reference"
+  },
+  "NFF-13": {
+   "clip_dir": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/data_nff/clips/NFF-13__a7b816cd",
+   "split_file": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/data_nff/clips/NFF-13__a7b816cd/splits/nvs_50_50.json",
+   "md5": "8bc7218d375c4fed1b87cebdd2150963",
+   "n_train": 100,
+   "n_eval": 99,
+   "train_first_last": [
+    0,
+    198
+   ],
+   "eval_first_last": [
+    1,
+    197
+   ],
+   "role": "fog"
+  },
+  "NFF-15": {
+   "clip_dir": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/data_nff/clips/NFF-15__350d7f29",
+   "split_file": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/data_nff/clips/NFF-15__350d7f29/splits/nvs_50_50.json",
+   "md5": "8bc7218d375c4fed1b87cebdd2150963",
+   "n_train": 100,
+   "n_eval": 99,
+   "train_first_last": [
+    0,
+    198
+   ],
+   "eval_first_last": [
+    1,
+    197
+   ],
+   "role": "fog"
+  }
+ }
+}
