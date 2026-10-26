@@ -189,3 +189,66 @@ AFFECTED + CORRECTED:
    28.37/.870/.221 (NFF-15); B0'-head 24.19/.721/.297, 24.60/.764/.444. Head weights in heads/.
 LESSON (recorded in memory): GT for ANY per-ray comparison must come from the dataset loader,
  never from the image file.
+
+---
+TASK: P1/P2 (T1-T10, plan-agent numbering)  STATUS: P2 camera gate PASSED; lidar mixture iterating
+WHAT EXISTS:
+ T1/T3: neurad.py rgb_head flag + MediumConfig in-loop medium (commits d5d24fa3, abc97550);
+ T2: calibrated 147-param heads, B0' vs B0-CNN at ray res: 24.19/26.93 (NCF-02), 24.60/28.37 (NFF-15);
+ T5: mixture module (tests 9/9); T7: Hahner+LISA vendored (third_party/PINNED.md, upstream
+ ParameterSet bug bypassed, aarch64 mie.so); T8: 1393 clear depth renders; T9: 4 synthetic-fog
+ clips in data_fogsim/ (range-image regeneration self-check: 100% cell agreement, 2 mm; Hb030
+ drops 31%, Hb060 50% + halo 0.24->0.40, LISA drop pattern differs = designed sim mismatch).
+EVIDENCE (T10a, p2/<variant>_t10a/results.json):
+ camera-only beta recovery: 0.0288/0.03, 0.0588/0.06, 0.0288/0.03 (LISA) -> all within 4-5%
+ (gate: 20%). Airlight 0.755 vs 0.75 true. Zero-fog control on clear clip: beta -> 0.0004.
+ SELF-CONSISTENT control (GT built with the model's own formation): beta recovered EXACTLY
+ (0.0300/0.0600, A=0.750) -> fit code exact; the -4% on stored JPEGs = documented GT formation
+ mismatch (sky handling), well inside the gate.
+ Fitted medium explains fog: held-out foggy frames, clear-scene render 9.3-11.3 PSNR ->
+ with fitted medium 24.6-26.6 (+13-17 dB), LPIPS 0.46->0.23. Quals: p2/*_t10a/qual_*.png.
+ lidar-only/joint: degenerate optimum found (g->0, beta->0: all mass to noise floor, flat
+ renormalised mixture). T10b (job 3750809): gain FIXED at 1 (clear ckpt intensity is the
+ physical anchor); eta/theta stay learnable; min_range 2.5 m; drop NLL on below-horizon
+ non-returns only.
+VALIDATE-AGENT ROUND 2 (all applied): dataclasses.field shadowing crash (B1); old configs
+ lack `medium` (B2, defensive default); fog-echo magnitude calibration (eta learnable);
+ sky non-returns excluded from drop NLL; returns z>120 m dropped; beam classification from
+ source clip for fogsim clones (dataparser patch); S-column assert.
+OPEN: T4 zero-fog bitwise check on the REAL pipeline showed max diff 0.285 - diagnostic rerun
+ in flight (determinism control; suspicion: eval-render nondeterminism or an ON-path
+ difference not visible statically). P2 numbers are unaffected (fits replicate transport on
+ cached tensors; self-consistent control exact), but the in-loop renderer must pass T4 before
+ it is used for training (P3).
+NEXT: T10b results; T4 diagnosis; T11 (Sramp: beta(t) curve recovery - the generated ramp is
+ temporally-varying homogeneous, so a TIME curve, not a spatial field, is the honest first
+ target; true spatial-bank generator = T11-v2).
+
+---
+T10b + T4 diagnosis (2026-10-26 ~05:30)
+T10b (gain fixed at 1; p2/<variant>/results.json; first round archived in p2/*_t10a/):
+ lidar-only beta: 0.0027/0.03, 0.0105/0.06, 0.0029/0.03 - better than the degenerate ~0 but
+ still 5-10x low; joint 0.019/0.043/0.020 (dragged by the lidar term); camera-only unchanged
+ (0.0288/0.0588/0.0288 - the P2 gate stands). k_lidar +-30% swings lidar beta by ~x2.
+ IDENTIFIABILITY ANALYSIS (why the lidar inverse underestimates): in E_F = eta*k_L*beta*T^2*K*ds
+ the product eta*beta sets the halo amplitude, and over the halo's short range span (2.5-10 m)
+ T^2 barely varies -> eta and beta are nearly degenerate; with theta also learnable the drop
+ rate can be absorbed too. The fit parks amplitude in eta and keeps beta small. FIX for next
+ session (T10c): calibrate theta on the CLEAR clip (match its below-horizon non-return rate)
+ and pin eta from the simulator's own backscatter constant; then beta alone must explain the
+ range-dependent drop excess + far-surface attenuation. The useful scientific finding stands:
+ single-sensor LiDAR fog inversion is ill-posed without cross-sensor or calibration anchors -
+ exactly the shared-medium argument (E3).
+T4 (jobs 3750810/3752795): the eval renderer is STOCHASTIC (two identical renders differ up to
+ 0.41 rgb / 79 m depth at single pixels; mean 5e-5) -> bitwise comparison void; the zero-fog
+ gap EQUALS the determinism floor, i.e. no medium-path discrepancy beyond sampler noise.
+ Seeded-render rerun (3752795) gives the rigorous verdict; per-op bitwise guarantees proven at
+ the transport level (CPU suite + self-consistent control exact).
+
+T4 FINAL (job 3752795): nondeterminism persists under seeding -> CUDA atomics (nerfacc/tcnn
+float non-associativity), not RNG. Bitwise full-pipeline comparison is unattainable without
+deterministic kernels. Decisive evidence the medium path is clean at beta=0: the on/off diff
+is ZERO on sky pixels (acc<0.9) and lives only on dense surfaces (atomic-contention regions)
+- airlight leakage would show on sky first. Zero-fog verdict: HOLDS to within kernel
+nondeterminism; proof chain = CPU bitwise suite + exact self-consistent control + sky-pixel
+invariance. Sufficient for P2/P3 (training is stochastic anyway).

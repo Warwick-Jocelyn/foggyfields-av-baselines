@@ -9,7 +9,7 @@ READ FIRST, in order:
 3. reports/overnight1/REPORT.md                                                     (what was done, with evidence)
 4. Claude memory: foggyfields-overnight1.md (+ ncf-nff-crop-ablation-project.md)
 
-STATE (2026-10-26 ~03:00):
+STATE (2026-10-26 ~05:30, P1/P2 session):
 - Tasks 0-3 done, reported, pushed to github Warwick-Jocelyn/foggyfields-av-baselines (d32b221):
   src/foggyfields/ (MediumIntegrator + transport, 8/8 tests), reports/overnight1/.
 - Task 4 B1-lite: slurm job 3750288 (debug) fits (beta0, A, g) on frozen NeuRAD ckpts,
@@ -26,3 +26,12 @@ STANDING RULES: user authorised full autonomy (no permission questions); small-s
   as editable .md files in store-shared.
 NEXT MILESTONES (plan §6): P1 analytic plane-scene tests + per-sample RGB head (attach
   neurad_field.py:141-144); P2 synthetic fog (Hahner + LISA) on NCF-02; CVPR go/no-go 11-09.
+
+P1/P2 STATE (05:30): T1-T10 done. P2 CAMERA GATE PASSED (beta within 4-5%, A 0.755/0.75,
+zero-fog + self-consistent controls clean; +13-17 dB fog explanation on held-out). LiDAR
+mixture underestimates beta (eta*beta degeneracy + theta freedom) -> T10c: calibrate theta on
+clear clip, pin eta from sim constants. T4: eval renderer stochastic; seeded rerun 3752795.
+T11 (Sramp): fit beta(t) CURVE (the ramp variant is temporally-varying homogeneous by
+construction); true spatial-bank generator = T11-v2 (per-point path-integral tau, binned-alpha
+Hahner calls). Synthetic data: foggyfields/data_fogsim/ (keep). Heads: foggyfields/heads/.
+All numbers: p2/*/results.json (+ p2/*_t10a archived first round).

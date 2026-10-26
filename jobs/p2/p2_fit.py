@@ -152,9 +152,12 @@ def main():
         fog = HomogeneousFog(a.beta_init).to(dev)
         integ = MediumIntegrator(fog, max_range=model.config.medium.max_range).to(dev)
         A_raw = torch.nn.Parameter(torch.logit(torch.tensor([0.5] * 3, device=dev)))
-        g_raw = torch.nn.Parameter(torch.zeros((), device=dev))
+        # gain FIXED at 1: a_S is the clear checkpoint's intensity, already calibrated to this
+        # sensor; a free gain gave the lidar NLL a degenerate optimum (g->0, beta->0: everything
+        # becomes noise floor with a flat renormalised return mixture). T10b fix.
+        g_raw = torch.zeros((), device=dev)
         mix = FogReturnMixture(mixcfg).to(dev)
-        opt = torch.optim.Adam([fog.raw_beta0, A_raw, g_raw, *mix.parameters()], lr=0.03)
+        opt = torch.optim.Adam([fog.raw_beta0, A_raw, *mix.parameters()], lr=0.03)
         hist = []
         for it in range(iters or a.iters):
             opt.zero_grad()
