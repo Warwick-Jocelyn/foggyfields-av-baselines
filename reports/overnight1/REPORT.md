@@ -364,3 +364,20 @@ ROUND 2 (launched): V2b = V2 schedule, mixture OFF (attenuation + trusted heuris
  (freeze from step 1); V2b seeds s1/s2 (G1 needs seed std). A8 finding stands: fog ckpt's
  free-space extinction == clear floor -> baked fog is in APPEARANCE, un-baking is the hard
  path (V1), prevention is the method (V2 family).
+
+---
+P3 ROUND 2 (V2b/V2c + seeds, job 3756103; evals 3757531)
+V2b (no mixture + R2 alpha-bimodal 1e-3), 3 seeds: beta 0.0103/0.0106/0.0106 (seed spread
+ +-0.0002!), rgb_ray-on 25.26/25.01/24.94 (+7 dB over V2; -1.4 dB vs V0 ref), BUT separation
+ PARTIAL: dark-beta(medium-off) 0.019-0.022 - the medium carries only ~1/3 of the fog, the
+ appearance re-absorbs the rest. LiDAR near-bin regressed (0-10 m >5 m ~0.116 vs B0 0.042;
+ suspected: trusted mask removes near geometry supervision), intensity RMSE ~0.10.
+V2c (mixture pinned at SYNTHETIC calibration): catastrophic (loss 52, beta collapse, lidar
+ median 3.8 m) -> theta must be calibrated on REAL clear data; synthetic values do not port.
+THE SEESAW: full separation/poor quality (V2) vs good quality/partial separation (V2b).
+ The appearance channel is the fog sponge; whenever beta may drift down, the optimizer
+ shortcuts fog back into appearance.
+ROUND 3 (job 3757574): ANCHOR-FOREVER - beta pinned at the dark-channel measurement 0.0321
+ for the entire run (defensible as calibration, like camera intrinsics); appearance gains
+ nothing from absorbing fog. V2d (+2 seeds) and V2e (= V2d, trusted mask OFF) to isolate the
+ near-bin regression.
