@@ -131,3 +131,36 @@ DECISIONS TAKEN: ordered_airlight integrates intervals between scene samples exa
  re-binning on the medium grid (first implementation leaked airlight into the half-bin behind a
  wall; the test caught it).
 NEXT: Task 4 B1-lite fit on NFF-15.
+
+---
+TASK: 4 (B1-lite)  STATUS: done — GATE FAILED as A2 predicted (useful negative result; not tuned past)
+WHAT EXISTS: jobs/b1lite_fit.py + jobs/b1lite.sbatch; results in b1lite/{NFF-15,NFF-13}/results.json
+ + qual_*.png (gt | backbone | overlay). Slurm job 3750288 (debug, ~15 min, 2 GPUs). Scene FROZEN
+ (NeuRAD 30k fog checkpoints); fitted: beta_0, airlight A (3-vec), gain g. Camera = expected-depth
+ overlay (P1 prototype, labelled; audit Q3). LiDAR = surface-echo attenuation E_S*T^2 only.
+ Zero-fog reduction on a real frame: EXACT on GPU (logged in b1lite logs).
+EVIDENCE (NFF-15 primary / NFF-13 spray-contrast):
+ fitted beta_0: joint 0.0071 / 0.0111;  camera-only 0.0181 / 0.0358;  lidar-only 0.0004 / 0.0004
+ A4 camera anchor: 0.0252 / ~0.0056(floor)
+ RGB held-out (33 front_wide frames, central 84% crop, render res — INTERNAL A/B only, not the
+ bench protocol number): backbone 15.78/.720/.422 -> b1lite 15.90/.703/.472 (NFF-15);
+ 16.19/.712/.388 -> 16.43/.708/.409 (NFF-13). PSNR +0.1-0.2 but SSIM/LPIPS WORSE.
+ LiDAR intensity RMSE (99 held-out sweeps): 0.0572 -> 0.0690 (NFF-15), 0.0555 -> 0.0631 (NFF-13): WORSE.
+ Range metrics: unchanged (structural: frozen scene + attenuation-only cannot move depth).
+GATE (task file: "reduces the >5 m tail at all, with plausible beta"):
+ - tail: unchanged by construction -> fail.
+ - plausible beta: joint beta = 0.28x anchor on NFF-15 -> fail. Lidar-only beta -> 0: the frozen
+   fog-trained scene ALREADY encodes the LiDAR attenuation (double-counting makes intensity worse).
+ - DIAGNOSIS (the point of the exercise): A2 says the fog-specific tail is fog-echoes-as-surfaces;
+   B1-lite confirms attenuation-on-frozen-scene explains nothing more. The fix is (i) the fog-echo
+   MIXTURE (§5.4) and (ii) scene unfreezing so fog can leave the geometry (P3 warm-start schedule).
+ - POSITIVE byproduct: cross-sensor asymmetry. Camera-only fit recovers beta = 0.018 = 0.72x the
+   DCP anchor on NFF-15 (a real residual haze signal the frozen camera branch under-represents),
+   while lidar-only recovers 0. On near-clear NFF-13 the camera-only fit absorbs non-fog residuals
+   (motion blur/exposure -> beta 0.036 >> floor): the overlay fit alone is NOT a clean fog
+   estimator; it needs the mixture-side constraints — exactly the shared-medium argument (E3).
+DECISIONS TAKEN: did not run the scene-unfreezing variant (A2+these numbers already determine the
+ next step; unfreezing without the mixture would only let fog hide in geometry again).
+OPEN QUESTIONS FOR JOCELYN: none new (NFF-13 spray question stands).
+NEXT: P1/P2 per plan §6 — per-sample RGB head + mixture return model; synthetic fog (Hahner+LISA)
+ on NCF-02 for controlled beta recovery before any real-fog refit.

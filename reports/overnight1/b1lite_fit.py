@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, '/capstor/scratch/cscs/yitiwang/foggyfields-baseline/medium')
+sys.path.insert(0, '/capstor/scratch/cscs/yitiwang/foggyfields/medium')
 from foggyfields.medium import HomogeneousFog  # noqa: E402
 
 
