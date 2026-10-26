@@ -1,0 +1,23 @@
+{
+ "clip": "NCF-02",
+ "ckpt": "/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_fix/neurad/safe/NCF-02/neurad_safe_NCF-02/neurad/2026-10-25_044149/nerfstudio_models/step-000029999.ckpt",
+ "step": 29999,
+ "head_params": 147,
+ "train_frames": 14,
+ "train_rays": 560000,
+ "fit_seconds": 5.129231691360474,
+ "eval_frames": 14,
+ "eval": {
+  "b0_cnn_at_ray_res": {
+   "psnr": 26.92673964372052,
+   "ssim": 0.8337522745132446,
+   "lpips": 0.15868204193455832
+  },
+  "b0p_head": {
+   "psnr": 24.194661411337428,
+   "ssim": 0.7208496587617057,
+   "lpips": 0.2965860515832901
+  }
+ },
+ "note": "B0 CNN area-downsampled to the ray-res grid for like-for-like; all scene params frozen, head only"
+}

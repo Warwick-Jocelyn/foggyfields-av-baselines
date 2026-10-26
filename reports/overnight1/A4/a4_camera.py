@@ -10,10 +10,9 @@ NFF-05 is a NIGHT clip: no daylight airlight; its value is recorded but flagged 
 """
 import csv, glob, json
 import numpy as np
-from PIL import Image
 from scipy.ndimage import minimum_filter
 
-FF = '/capstor/scratch/cscs/yitiwang/foggyfields-baseline'
+FF = '/capstor/scratch/cscs/yitiwang/foggyfields'
 rows = []
 for clip in ['NCF-02', 'NFF-05', 'NFF-13', 'NFF-15']:
     betas, As = [], []
@@ -22,8 +21,14 @@ for clip in ['NCF-02', 'NFF-05', 'NFF-13', 'NFF-15']:
         depth = d['depth'].astype(np.float32)
         acc = d['accumulation'].astype(np.float32)
         H, W = depth.shape
-        gt = np.asarray(Image.open(str(d['image_filename'])).resize((W, H), Image.BILINEAR),
-                        dtype=np.float32) / 255.0
+        gtp = f.replace('.npz', '_gtcrop.npy')  # safe-cropped GT at the ray grid (validate fix)
+        if not __import__('os').path.exists(gtp):
+            continue
+        gt = np.load(gtp)
+        if gt.shape[:2] != (H, W):   # render grid vs eval-trimmed grid off-by-one guard
+            m0, m1 = min(H, gt.shape[0]), min(W, gt.shape[1])
+            gt, depth, acc = gt[:m0, :m1], depth[:m0, :m1], acc[:m0, :m1]
+            H, W = m0, m1
         dark = minimum_filter(gt.min(-1), size=7)
         hb, wb = int(H * 0.08), int(W * 0.08)
         sl = np.s_[hb:H - hb, wb:W - wb]

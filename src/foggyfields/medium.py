@@ -53,9 +53,10 @@ class MediumLUT:
     keep attenuating instead of freezing at tau(max_range).
     """
 
-    def __init__(self, edges: Tensor, tau: Tensor):
+    def __init__(self, edges: Tensor, tau: Tensor, beta_mid: Tensor | None = None):
         self.edges = edges
         self.tau = tau
+        self.beta_mid = beta_mid  # [R, K] field value at bin midpoints (for fog-echo strengths)
 
     def tau_at(self, s: Tensor) -> Tensor:
         """s: [R] or [R, N] depths (metres) -> tau of the same shape."""
@@ -103,4 +104,4 @@ class MediumIntegrator(nn.Module):
         beta = self.field(pos)[..., 0]                      # [R, K]
         tau = torch.cumsum(beta * ds[None, :], dim=1)       # [R, K]
         tau = torch.cat([torch.zeros_like(tau[:, :1]), tau], dim=1)  # [R, K+1]
-        return MediumLUT(e, tau)
+        return MediumLUT(e, tau, beta_mid=beta)

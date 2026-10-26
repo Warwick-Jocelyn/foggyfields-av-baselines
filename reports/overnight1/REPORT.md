@@ -164,3 +164,28 @@ DECISIONS TAKEN: did not run the scene-unfreezing variant (A2+these numbers alre
 OPEN QUESTIONS FOR JOCELYN: none new (NFF-13 spray question stands).
 NEXT: P1/P2 per plan §6 — per-sample RGB head + mixture return model; synthetic fog (Hahner+LISA)
  on NCF-02 for controlled beta recovery before any real-fog refit.
+
+---
+CORRECTION (2026-10-26, after the validate-agent review)  STATUS: all affected numbers re-run
+BUG: every fit/eval script loaded GT with PIL from disk = the FULL uncropped canvas, while the
+ cameras/ray grid describe the SAFE-CROPPED image -> vertically misregistered GT (silent).
+ Found by the validate agent reviewing jobs/fit_rgb_head.py before J1. Fix: GT via
+ dataset.get_image_float32 (applies image_crops). Invalid outputs archived in
+ b1lite_INVALID_canvasGT/ (numbers survive in git history); re-run in job 3750743.
+AFFECTED + CORRECTED:
+ - Task 4 B1-lite: camera-side numbers were invalid. CORRECTED (NFF-15 / NFF-13):
+   joint beta 0.0008 / 0.0006; camera-only 0.0012 / 0.0007; lidar-only 0.0003 / 0.0004.
+   backbone RGB held-out now sane: 28.77/.880/.211 (NFF-15), 31.69/.918/.145 (NFF-13);
+   b1lite == backbone (beta ~ 0 -> overlay ~ identity).
+   **RETRACTED: the "cross-sensor asymmetry" finding.** The camera-only residual beta=0.018 was
+   the overlay compensating GT misregistration. Clean corrected conclusion: the frozen
+   fog-trained scene absorbs the fog COMPLETELY in both sensors; B1-lite recovers nothing
+   (gate failed, cleanly); separation requires P2 controlled recovery + P3 scene refit.
+ - A4 camera anchors (re-fit on cropped GT, tighter): control floor NCF-02 0.0077+-0.0012;
+   NFF-15 0.0321+-0.0030 (MOR ~93 m); NFF-13 0.0090+-0.0004 (barely above floor -> SPRAY
+   interpretation stands); NFF-05 0.0146 (night, flagged). P2/P3 beta inits use these.
+ - A2/A1/A4-lidar: unaffected (no camera GT involved).
+ - T2 (B0' head) ran with the fix from the start: B0-CNN at ray res 26.93/.834/.159 (NCF-02),
+   28.37/.870/.221 (NFF-15); B0'-head 24.19/.721/.297, 24.60/.764/.444. Head weights in heads/.
+LESSON (recorded in memory): GT for ANY per-ray comparison must come from the dataset loader,
+ never from the image file.

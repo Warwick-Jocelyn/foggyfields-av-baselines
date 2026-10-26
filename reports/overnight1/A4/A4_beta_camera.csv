@@ -1,5 +1,5 @@
 clip,n_frames,beta_C,beta_C_std,airlight_A,mor_m,note
-NCF-02,12,0.00559,0.00102,0.571,536.0,clear control
-NFF-05,12,0.015,0.00305,0.449,200.0,NIGHT - unusable airlight
-NFF-13,12,-0.00413,0.0008,0.579,,day fog
-NFF-15,12,0.02518,0.00943,0.55,119.0,day fog
+NCF-02,12,0.00774,0.0012,0.604,388.0,clear control
+NFF-05,12,0.01456,0.00249,0.441,206.0,NIGHT - unusable airlight
+NFF-13,12,0.00903,0.00039,0.58,332.0,day fog
+NFF-15,12,0.03211,0.00303,0.544,93.0,day fog

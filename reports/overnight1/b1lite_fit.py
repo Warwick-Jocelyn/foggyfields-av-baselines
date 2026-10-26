@@ -64,8 +64,9 @@ def main():
             H, W = dpt.shape
             rgb = out['rgb'].permute(2, 0, 1)[None]
             rgb = torch.nn.functional.interpolate(rgb, size=(H, W), mode='area')[0].permute(1, 2, 0)
-            gt = torch.from_numpy(np.asarray(Image.open(names[i]).resize((W, H), Image.BILINEAR),
-                                             dtype=np.float32) / 255.0).to(dev)
+            gt_full = tds.get_image_float32(i)[..., :3]  # safe-crop applied (validate-agent fix)
+            gt = torch.nn.functional.interpolate(gt_full.permute(2, 0, 1)[None], size=(H, W),
+                                                 mode='area')[0].permute(1, 2, 0).to(dev)
             cam_cache.append((rgb.float(), dpt.float(), acc.float(), gt))
     print(f'[b1] cached {len(cam_cache)} train camera frames', flush=True)
 
@@ -161,8 +162,8 @@ def main():
             H, W = dpt.shape
             rgb = torch.nn.functional.interpolate(out['rgb'].permute(2, 0, 1)[None], size=(H, W),
                                                   mode='area')[0].permute(1, 2, 0)
-            gt = torch.from_numpy(np.asarray(Image.open(enames[i]).resize((W, H), Image.BILINEAR),
-                                             dtype=np.float32) / 255.0).to(dev)
+            gt = torch.nn.functional.interpolate(eds.get_image_float32(i)[..., :3].permute(2, 0, 1)[None],
+                                                 size=(H, W), mode='area')[0].permute(1, 2, 0).to(dev)
             T = torch.exp(-bj * dpt)[..., None]
             ov = T * rgb + (1 - T) * Aj[None, None, :]
             T_far = math.exp(-bj * 120.0)
@@ -188,8 +189,8 @@ def main():
             H, W = dpt.shape
             rgb = torch.nn.functional.interpolate(out['rgb'].permute(2, 0, 1)[None], size=(H, W),
                                                   mode='area')[0].permute(1, 2, 0)
-            gt = torch.from_numpy(np.asarray(PImage.open(enames[i]).resize((W, H)),
-                                             dtype=np.float32) / 255.0).to(dev)
+            gt = torch.nn.functional.interpolate(eds.get_image_float32(i)[..., :3].permute(2, 0, 1)[None],
+                                                 size=(H, W), mode='area')[0].permute(1, 2, 0).to(dev)
             T = torch.exp(-bj * dpt)[..., None]
             ov = acc[..., None] * (T * rgb + (1 - T) * Aj[None, None, :]) + \
                  (1 - acc[..., None]) * (math.exp(-bj * 120.0) * rgb + (1 - math.exp(-bj * 120.0)) * Aj[None, None, :])
