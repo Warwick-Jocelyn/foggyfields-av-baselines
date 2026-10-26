@@ -252,3 +252,47 @@ is ZERO on sky pixels (acc<0.9) and lives only on dense surfaces (atomic-content
 - airlight leakage would show on sky first. Zero-fog verdict: HOLDS to within kernel
 nondeterminism; proof chain = CPU bitwise suite + exact self-consistent control + sky-pixel
 invariance. Sufficient for P2/P3 (training is stochastic anyway).
+
+---
+T10c / T11 first round + T10d (2026-10-26 morning)
+T10c (eta pinned to Hahner's 0.046/ln20=0.01536, g=1, linear-L1 intensity term):
+ lidar-only beta 0.0069/0.03, 0.0131/0.06, 0.0082/0.03 — improved (t10b 0.003) but still ~4x low.
+DECISIVE DIAGNOSTIC (numpy, matched clear/fogged point pairs, unscattered survivors, I>0.02):
+ ln(I_fog/I_clear) vs r slope gives beta = 0.0293 vs true 0.03 (98%). The synthetic intensity
+ carries the full signal — the FIT was burying it: linear-space L1 over ALL returns mixes
+ scattered halo points (fog-echo intensity vs predicted attenuated-surface) and lets bright
+ points dominate; the range-NLL outweighs the rest.
+T10d fix: intensity residual in LOG space, restricted to confident surface returns
+ (|z - clear depth| < 1 m, model intensity > 0.02, observed > 1.5/255) — exactly the
+ regression that works. Job 3752955.
+T11 first round FAILED for two instrumentation reasons (not model reasons): camera ray times
+ were all 0 (cameras.times is None in this dataparser -> only knots 0-1 received gradient;
+ knots 2-7 sat at init) and only 2 frames/camera = 2 distinct time points for 8 knots.
+ Fixed: frame time parsed from the filename; 56 camera frames (8 per camera). Same job.
+
+---
+T10d RESULTS (job 3752955) — **LiDAR gate PASSED on Hahner, honest fail on LISA**
+ With the log-ratio surface-return intensity residual:
+   Hb030: lidar-only beta 0.0260 (-13%), joint 0.0260 — ALL four gates True.
+   Hb060: lidar-only 0.0530 (-12%), joint 0.0531 — ALL gates True.
+   Lb030 (LISA): lidar-only 0.0136 (-55%) — FAILS, and should: LISA's intensity-attenuation law
+   differs from the Hahner-class E_S model (its cloud-scatter path + different extinction
+   handling). That is exactly what the mismatched-simulator test is for: it shows which parts
+   of the sensor model transfer (range/drop physics) and which are simulator-specific
+   (intensity law). Camera gate passes on BOTH sims regardless.
+ k_lidar +-30% sensitivity now brackets the truth (0.037/0.020 around 0.026 at k=1).
+T11 SECOND FAILURE -> DATA BUG FOUND: the camera fit exploded (beta -> 0.5-0.7) because the
+ stored Sramp IMAGES carry constant beta ~0.2, not the ramp (back-solved from matched
+ clear/fogged pixels; lidar sweeps ARE correctly ramped — lidar_only knots trend upward).
+ The other three variants verify perfectly (implied 0.0296/0.0592/0.0296 vs true
+ 0.03/0.06/0.03). Cause not reproducible from the code (same code wrote all four);
+ fix: deleted the bad images, added a POST-WRITE VERIFICATION to the generator (back-solve
+ one frame, assert within 20%), regenerating. T11 rerun after.
+
+---
+T11 FINAL (job 3754213) — beta(t) RAMP RECOVERY: GATE PASSED, ALL THREE MODES
+ After the n_frames generation bug (verified regeneration), the time-coverage fix (linspace
+ sampling incl. clip end) and the np.int64 cast: fog-bank ramp beta(t)=0.005->0.06, 8-knot
+ piecewise-linear curve, max rel err (t>=0.3): camera 6.1%, lidar 16.8%, joint 16.4%.
+ P2 is now COMPLETE: homogeneous beta (two simulators), temporal beta(t), airlight, all
+ controls (zero-fog, self-consistent, mismatched-sim, LISA convention isolation).

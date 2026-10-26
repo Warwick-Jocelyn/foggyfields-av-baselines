@@ -37,6 +37,15 @@ def main():
     ap.add_argument('--iters', type=int, default=600)
     ap.add_argument('--n-frames', type=int, default=12)
     ap.add_argument('--n-sweeps', type=int, default=15)
+    ap.add_argument('--temporal-knots', type=int, default=0,
+                    help='>0: fit beta(t) piecewise-linear over clip time instead of a scalar (T11)')
+    ap.add_argument('--eta-fixed', type=float, default=None,
+                    help="pin the backscatter-to-extinction ratio (T10c: Hahner's 0.046/ln20=0.01536)")
+    ap.add_argument('--intensity-rt-factor', type=float, default=2.0,
+                    help='exponent factor in the intensity attenuation e^{-F*beta*r}: 2 = physical '
+                         'round trip (Hahner); 1 = LISA\'s vendored one-way convention')
+    ap.add_argument('--intensity-weight', type=float, default=0.0,
+                    help='T10c: L1 weight on g*a_S*T^2 vs observed fogged intensity (returns only)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     from PIL import Image
@@ -74,8 +83,8 @@ def main():
     sel = []
     for cn in cams:
         ci = [i for i, n in enumerate(names) if f'/{cn}/' in n]
-        sel += ci[:: max(len(ci) // per, 1)][: per]
-    CC, WW, SS, OO, DD, GG = [], [], [], [], [], []
+        sel += [ci[j] for j in np.linspace(0, len(ci) - 1, per).astype(int)]  # cover clip END too
+    CC, WW, SS, OO, DD, GG, TT = [], [], [], [], [], [], []
     rng = np.random.default_rng(0)
     with torch.no_grad():
         for i in sel:
@@ -103,19 +112,23 @@ def main():
             keep = torch.from_numpy(rng.choice(len(c), size=min(30000, len(c)), replace=False))
             CC.append(c[keep]); WW.append(w[keep]); SS.append(s[keep])
             OO.append(o[keep]); DD.append(d[keep]); GG.append(gt[keep])
+            fi = int(Path(names[i]).stem.split('_')[-1])   # frame_XXXX -> clip time
+            TT.append(torch.full((len(keep),), fi / 198.0))
     C = torch.cat(CC).to(dev).float(); Wt = torch.cat(WW).to(dev).float()
     S = torch.cat(SS).to(dev).float().clamp(max=model.config.medium.max_range)
     O = torch.cat(OO).to(dev); Dir = torch.cat(DD).to(dev)
     G = torch.cat(GG).to(dev)
+    Tc = torch.cat(TT).to(dev)  # per-ray clip time in [0, 1]
     assert S.shape[1] == Wt.shape[1], (S.shape, Wt.shape)  # sky column last in both
     print(f'[p2] camera cache {C.shape} over {len(sel)} frames', flush=True)
 
     # ---------- lidar cache ----------
     lds = dm.train_lidar_dataset
-    stepw = max(len(lds) // a.n_sweeps, 1)
-    LD, LA, LZ, LR, LO, LDir, sweep_ids = [], [], [], [], [], [], []
+    sweep_sel = list(np.linspace(0, len(lds) - 1, a.n_sweeps).astype(int))
+    LD, LA, LZ, LR, LO, LDir, LI, LT, sweep_ids = [], [], [], [], [], [], [], [], []
     with torch.no_grad():
-        for i in range(0, len(lds), stepw):
+        for i in sweep_sel:
+            i = int(i)  # np.int64 fails ad_model's isinstance(..., int) assert
             batch = dict(lds[i]); batch['lidar_idx'] = i
             batch['lidar'] = batch['lidar'].to(dev)
             lidar = lds.lidars[i: i + 1].to(dev)
@@ -133,11 +146,14 @@ def main():
             idx = torch.cat([idx_r, idx_n])
             LD.append(D[idx].cpu()); LA.append(A_s[idx].cpu()); LZ.append(z[idx].cpu())
             LR.append(ret[idx].cpu()); LO.append(o[idx].cpu()); LDir.append(dr[idx].cpu())
+            LI.append(pts[idx, 3].cpu())                       # observed (fogged) intensity
+            LT.append(torch.full((len(idx),), i / max(len(lds) - 1, 1)))
             sweep_ids.append(i)
             if len(sweep_ids) >= a.n_sweeps:
                 break
     LD = torch.cat(LD).to(dev); LA = torch.cat(LA).to(dev); LZ = torch.cat(LZ).to(dev)
     LR = torch.cat(LR).to(dev); LO = torch.cat(LO).to(dev); LDir = torch.cat(LDir).to(dev)
+    LI = torch.cat(LI).to(dev); LT = torch.cat(LT).to(dev)
     LR = LR & (LZ <= model.config.medium.max_range)  # observed ranges beyond the LUT: drop from returns
     LD_c = LD.clamp(max=model.config.medium.max_range)
     # drop_nll only on BELOW-HORIZON non-returns (sky rays never return in clear air either;
@@ -146,45 +162,92 @@ def main():
     print(f'[p2] lidar cache {LD.shape} rays ({int(LR.sum())} returns) over {len(sweep_ids)} sweeps', flush=True)
 
     # ---------- fits ----------
+    edges = MediumIntegrator(HomogeneousFog(0.01), max_range=model.config.medium.max_range).edges.to(dev)
+
+    class BetaKnots(torch.nn.Module):
+        """T11: beta(t) piecewise-linear over clip time (softplus-positive knots)."""
+        def __init__(self, k, init):
+            super().__init__()
+            self.raw = torch.nn.Parameter(HomogeneousFog._inv_softplus(
+                torch.full((k,), float(max(init, 1e-6)))).to(dev))
+            self.k = k
+
+        def at(self, t):  # t [R] in [0,1] -> beta [R]
+            x = t.clamp(0, 1) * (self.k - 1)
+            i0 = x.floor().long().clamp(0, self.k - 2)
+            w = x - i0.float()
+            b = torch.nn.functional.softplus(self.raw)
+            return b[i0] * (1 - w) + b[i0 + 1] * w
+
+    from foggyfields.medium import MediumLUT as _ML
+
+    def make_lut(fog_or_knots, Opts, Dpts, tvec):
+        if isinstance(fog_or_knots, BetaKnots):
+            return _ML(edges, fog_or_knots.at(tvec)[:, None] * edges[None, :],
+                       beta_mid=fog_or_knots.at(tvec)[:, None].expand(-1, len(edges) - 1))
+        return MediumIntegrator(fog_or_knots, max_range=model.config.medium.max_range).to(dev)(Opts, Dpts)
+
     def fit(use_cam, use_lid, tag, iters=None, k_lidar=1.0):
-        mixcfg = MixtureConfig(k_lidar=k_lidar, eta=0.03, learn_eta=True, s0_near=2.0,
-                               theta=1e-6, learn_theta=True, min_range=2.5)
-        fog = HomogeneousFog(a.beta_init).to(dev)
-        integ = MediumIntegrator(fog, max_range=model.config.medium.max_range).to(dev)
+        eta0 = a.eta_fixed if a.eta_fixed is not None else 0.03
+        mixcfg = MixtureConfig(k_lidar=k_lidar, eta=eta0, learn_eta=a.eta_fixed is None,
+                               s0_near=2.0, theta=1e-6, learn_theta=True, min_range=2.5)
+        if a.temporal_knots > 0:
+            fog = BetaKnots(a.temporal_knots, a.beta_init)
+            fog_params = [fog.raw]
+        else:
+            fog = HomogeneousFog(a.beta_init).to(dev)
+            fog_params = [fog.raw_beta0]
         A_raw = torch.nn.Parameter(torch.logit(torch.tensor([0.5] * 3, device=dev)))
-        # gain FIXED at 1: a_S is the clear checkpoint's intensity, already calibrated to this
-        # sensor; a free gain gave the lidar NLL a degenerate optimum (g->0, beta->0: everything
-        # becomes noise floor with a flat renormalised return mixture). T10b fix.
+        # gain FIXED at 1 (T10b): a_S is the clear checkpoint's calibrated intensity.
         g_raw = torch.zeros((), device=dev)
         mix = FogReturnMixture(mixcfg).to(dev)
-        opt = torch.optim.Adam([fog.raw_beta0, A_raw, *mix.parameters()], lr=0.03)
+        opt = torch.optim.Adam([*fog_params, A_raw, *mix.parameters()], lr=0.03)
         hist = []
         for it in range(iters or a.iters):
             opt.zero_grad()
             loss = torch.zeros((), device=dev)
             if use_cam:
-                lut = integ(O, Dir)
+                lut = make_lut(fog, O, Dir, Tc)
                 T = lut.transmittance(S)
                 A = torch.sigmoid(A_raw)
                 rgb = (Wt[..., None] * T[..., None] * C).sum(-2) \
                     + ordered_airlight(lut, A, scene_w=Wt, scene_s=S)
                 loss = loss + torch.mean((rgb - G) ** 2) * 20.0
             if use_lid:
-                lut_l = integ(LO, LDir)
+                lut_l = make_lut(fog, LO, LDir, LT)
                 g = torch.exp(g_raw)
                 E_S, E_F, s_mid = mix.echo_strengths(g * LA, LD_c, lut_l)
                 pi = mix.selection_probs(E_S, E_F)
                 nll = mix.nll(LZ[LR], LD_c[LR], pi[LR], s_mid).mean()
                 dnll = mix.drop_nll(pi[LNR]).mean() if LNR.any() else torch.zeros((), device=dev)
                 loss = loss + nll + 0.5 * dnll
+                if a.intensity_weight > 0:
+                    # T10d: LOG-ratio residual on confident SURFACE returns only (z ~= clear depth,
+                    # bright enough to be above the uint8 floor). A direct numpy regression of this
+                    # quantity recovers beta to 2% on the synthetic data; linear-space L1 over all
+                    # returns (T10c) buried that signal under scattered halo points.
+                    m_int = LR & ((LZ - LD).abs() < 1.0) & (LA > 0.02) & (LI > 1.5 / 255)
+                    if m_int.any():
+                        tau_z = lut_l.tau_at(LZ.clamp(max=120.0))
+                        resid = torch.log(LI[m_int] / (g * LA[m_int]).clamp(min=1e-6)) \
+                            + a.intensity_rt_factor * k_lidar * tau_z[m_int]
+                        loss = loss + a.intensity_weight * (resid ** 2).mean()
             loss.backward(); opt.step()
             if it % 150 == 0 or it == (iters or a.iters) - 1:
-                hist.append(dict(it=it, loss=float(loss), beta=float(fog.beta0),
+                bval = float(torch.nn.functional.softplus(fog.raw).mean()) if a.temporal_knots > 0 \
+                    else float(fog.beta0)
+                hist.append(dict(it=it, loss=float(loss), beta=bval,
                                  A=float(torch.sigmoid(A_raw).mean()), g=float(torch.exp(g_raw)),
                                  eta=float(mix.eta), theta=float(mix.theta)))
                 print(f'[p2:{tag}] {hist[-1]}', flush=True)
-        return dict(tag=tag, beta=float(fog.beta0), A=[float(x) for x in torch.sigmoid(A_raw)],
-                    g=float(torch.exp(g_raw)), eta=float(mix.eta), theta=float(mix.theta), hist=hist)
+        out = dict(tag=tag, A=[float(x) for x in torch.sigmoid(A_raw)],
+                   g=float(torch.exp(g_raw)), eta=float(mix.eta), theta=float(mix.theta), hist=hist)
+        if a.temporal_knots > 0:
+            out['beta_knots'] = [float(x) for x in torch.nn.functional.softplus(fog.raw)]
+            out['beta'] = float(np.mean(out['beta_knots']))
+        else:
+            out['beta'] = float(fog.beta0)
+        return out
 
     # code-correctness control: GT constructed with the MODEL's own formation at beta_true
     # -> camera fit must recover beta_true almost exactly (isolates formation mismatch of the
@@ -248,7 +311,22 @@ def main():
     agg = {t: {k: float(np.mean([r[t][k] for r in rows])) for k in ('psnr', 'ssim', 'lpips')} for t in rows[0]}
 
     bt = a.beta_true
-    res = dict(variant=a.variant, beta_true=bt, ckpt=str(ckpt_path),
+    ramp_eval = None
+    if a.temporal_knots > 0:
+        RAMP = (0.005, 0.06)  # must match make_fog_clip.py
+        tk = np.linspace(0, 1, a.temporal_knots)
+        true_k = RAMP[0] + (RAMP[1] - RAMP[0]) * tk
+        ramp_eval = {}
+        for mname, f in fits.items():
+            if 'beta_knots' in f:
+                bk = np.array(f['beta_knots'])
+                rel = np.abs(bk - true_k) / true_k
+                ramp_eval[mname] = dict(knots_fit=[round(float(x), 4) for x in bk],
+                                        knots_true=[round(float(x), 4) for x in true_k],
+                                        rel_err=[round(float(x), 3) for x in rel],
+                                        max_rel_err_t_ge_03=round(float(rel[tk >= 0.3].max()), 3),
+                                        gate_20pct_t_ge_03=bool(rel[tk >= 0.3].max() <= 0.2))
+    res = dict(variant=a.variant, beta_true=bt, ckpt=str(ckpt_path), ramp_eval=ramp_eval,
                fits={k: {kk: v[kk] for kk in ('beta', 'A', 'g')} for k, v in fits.items()},
                fit_history={k: v['hist'] for k, v in fits.items()},
                beta_rel_err={k: (abs(v['beta'] - bt) / bt if bt > 0 else None) for k, v in fits.items()},

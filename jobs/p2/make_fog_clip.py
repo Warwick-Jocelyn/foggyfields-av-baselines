@@ -134,9 +134,10 @@ def frame_depth_index():
 def make_images(variant, dst, didx):
     from PIL import Image
     n_missing = 0
-    cams = sorted(os.listdir(SRC / 'images_rectv2'))
-    frames = sorted(glob.glob(str(SRC / 'images_rectv2' / cams[0] / '*.jpg')))
-    n_frames = len(frames)
+    cams = sorted(d for d in os.listdir(SRC / 'images_rectv2')
+                  if (SRC / 'images_rectv2' / d).is_dir())
+    n_frames = max(len(glob.glob(str(SRC / 'images_rectv2' / c / '*.jpg'))) for c in cams)
+    assert n_frames > 100, f'frame count {n_frames} implausible'  # the n_frames=0 bug (T11)
     for cam in cams:
         (dst / 'images_rectv2' / cam).mkdir(parents=True, exist_ok=True)
         for f in sorted(glob.glob(str(SRC / 'images_rectv2' / cam / '*.jpg'))):
@@ -166,6 +167,25 @@ def make_images(variant, dst, didx):
             Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8)).save(o, quality=98)
     if n_missing:
         print(f'[t9:{variant}] WARNING {n_missing} frames had no depth render', flush=True)
+    # post-write verification: back-solve beta from one mid-clip stored frame; abort on mismatch
+    cam = 'camera_front_wide_120fov'
+    fi_chk = 100
+    f = str(SRC / 'images_rectv2' / cam / f'frame_{fi_chk:04d}.jpg')
+    d = np.load(didx[f], allow_pickle=True)
+    depth = d['depth'].astype(np.float32); acc = d['acc'].astype(np.float32)
+    x, y, w, h = [int(v) for v in d['crop']]
+    dn = depth / np.clip(acc, 0.3, None); dn[acc < 0.5] = MAX_RANGE; dn = np.clip(dn, 0, MAX_RANGE)
+    img = np.asarray(Image.open(f), dtype=np.float32) / 255.0
+    dcrop = np.array(Image.fromarray(dn).resize((w, h), Image.BILINEAR))
+    stored = np.asarray(Image.open(dst / 'images_rectv2' / cam / f'frame_{fi_chk:04d}.jpg'),
+                        dtype=np.float32) / 255.0
+    sc, ic = stored[y:y + h, x:x + w].mean(-1), img[y:y + h, x:x + w].mean(-1)
+    ok = (np.abs(ic - AIRLIGHT) > 0.15) & (dcrop > 8) & (dcrop < 60)
+    That = np.clip((sc[ok] - AIRLIGHT) / (ic[ok] - AIRLIGHT), 1e-3, 1)
+    b_imp = float(np.median(-np.log(That) / dcrop[ok]))
+    b_want = sweep_beta(variant, fi_chk, n_frames)
+    print(f'[t9:{variant}] VERIFY frame {fi_chk}: implied beta {b_imp:.4f} vs intended {b_want:.4f}', flush=True)
+    assert abs(b_imp - b_want) <= max(0.2 * b_want, 0.004), 'stored fog does not match intended beta'
 
 
 def make_variant(variant, stage='all'):
