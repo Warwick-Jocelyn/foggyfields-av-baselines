@@ -37,9 +37,11 @@ class MixtureConfig:
     temperature: float = 1.0
     s0_near: float = 2.0            # K(s) = 1/(s^2 + s0^2)
     k_lidar: float = 1.0            # beta_L = k_lidar * beta_ref (FIXED; A4: not calibratable)
-    eta: float = 1.0                # b_L = eta * beta_L
     theta: float = 1e-4             # noise floor, units of the echo strengths
     learn_theta: bool = False
+    eta: float = 1.0                # (duplicate kept for clarity) b_L = eta * beta_L
+    learn_eta: bool = False         # log-space learnable backscatter-to-extinction ratio
+    min_range: float = 0.0          # zero fog echoes below this range (sensor near-field censoring)
     prob_mode: Literal["softmax_log", "softmax_raw"] = "softmax_log"
 
 
@@ -52,10 +54,19 @@ class FogReturnMixture(nn.Module):
             self.log_theta = nn.Parameter(log_theta)
         else:
             self.register_buffer("log_theta", log_theta)
+        log_eta = torch.log(torch.tensor(float(self.cfg.eta)))
+        if self.cfg.learn_eta:
+            self.log_eta = nn.Parameter(log_eta)
+        else:
+            self.register_buffer("log_eta", log_eta)
 
     @property
     def theta(self) -> Tensor:
         return self.log_theta.exp()
+
+    @property
+    def eta(self) -> Tensor:
+        return self.log_eta.exp()
 
     def _K(self, s: Tensor) -> Tensor:
         return 1.0 / (s * s + self.cfg.s0_near ** 2)
@@ -71,8 +82,10 @@ class FogReturnMixture(nn.Module):
         tau_mid = 0.5 * (lut.tau[:, :-1] + lut.tau[:, 1:])  # [R, K] (linear interp at mids)
         T2_mid = torch.exp(-2.0 * kL * tau_mid)
         assert lut.beta_mid is not None, "LUT built without beta_mid"
-        E_F = self.cfg.eta * kL * lut.beta_mid * T2_mid * self._K(s_mid)[None, :] * ds[None, :]
+        E_F = self.eta * kL * lut.beta_mid * T2_mid * self._K(s_mid)[None, :] * ds[None, :]
         E_F = E_F * (s_mid[None, :] < D[:, None])           # occlusion: no fog echo behind the surface
+        if self.cfg.min_range > 0:
+            E_F = E_F * (s_mid[None, :] >= self.cfg.min_range)  # near-field censoring
         return E_S, E_F, s_mid
 
     def selection_logits(self, E_S: Tensor, E_F: Tensor) -> Tensor:
