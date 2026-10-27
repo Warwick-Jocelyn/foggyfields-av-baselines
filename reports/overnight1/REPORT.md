@@ -412,3 +412,14 @@ P3 ROUND 4 (V2f double-anchor x3 seeds + V2h trusted-on; jobs 3766540, eval 3767
 CONVERGED NEXT STEP = the plan's own §5.1: spatial field beta(x) = beta_anchor *
  exp(eps*tanh(f(x)) - mu) with mean-normalisation (global scale stays anchored) + R1 TV.
  The investigation reached it with an evidence chain rather than by assumption.
+
+---
+P3 ROUND 5 (V2s spatial field x3 + tv0; jobs 3767490, eval 3768584)
+ The spatial field trained into a FLAT ATTRACTOR: output constant (p10 == p90 == 0.0318 over
+ 20k samples) while the parameters blew up (grids absmax 5.6-7.3, pre-activation saturated
+ tanh everywhere, mu drifted to 1.49). Mechanism: nothing penalises pre-activation magnitude;
+ mean-normalisation makes uniform drift free; once tanh saturates, spatial gradients vanish
+ (tanh' ~= 0) and the field freezes flat. Quality identical to homogeneous V2f (~19.0) as a
+ result. TV=0 ablation: same flatness -> TV was not the cause.
+ FIX (round 6, V2t): R1' = TV + 0.1 * mean(pre_tanh^2) saturation penalty; medium lr 1e-2 ->
+ 3e-3. Unit suite extended (9/9).

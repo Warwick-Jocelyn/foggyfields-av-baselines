@@ -107,3 +107,71 @@ class MediumIntegrator(nn.Module):
         tau = torch.cumsum(beta * ds[None, :], dim=1)       # [R, K]
         tau = torch.cat([torch.zeros_like(tau[:, :1]), tau], dim=1)  # [R, K+1]
         return MediumLUT(e, tau, beta_mid=beta)
+
+class SpatialFog(nn.Module):
+    """Plan §5.1: beta(x) = beta_anchor * exp(eps * tanh(f(x)) - mu), mean-normalised so the
+    GLOBAL scale stays at the anchored measurement while the field redistributes it in space.
+
+    f(x) = torch-native multi-resolution dense feature grids (trilinear) + a 2x32 MLP; no tcnn
+    dependency, deterministic. mu is the running mean of eps*tanh(f) over the queried support,
+    updated with momentum (buffer; frozen in eval), so there is no second global scale.
+    tv() returns an L1 total-variation estimate on random grid points (R1 regulariser).
+    """
+
+    def __init__(self, beta_anchor: float, aabb, eps: float = 1.5,
+                 levels=(16, 32, 64), feat: int = 2, hidden: int = 32,
+                 mu_momentum: float = 0.01):
+        super().__init__()
+        if beta_anchor <= 0:
+            raise ValueError("beta_anchor must be > 0")
+        self.register_buffer("aabb", torch.as_tensor(aabb, dtype=torch.float32))  # [2, 3]
+        self.eps = eps
+        self.beta_anchor = beta_anchor
+        self.mu_momentum = mu_momentum
+        self.grids = nn.ParameterList(
+            nn.Parameter(torch.zeros(1, feat, r, r, r)) for r in levels)   # zero-init -> beta == anchor
+        self.mlp = nn.Sequential(nn.Linear(feat * len(levels), hidden), nn.ReLU(),
+                                 nn.Linear(hidden, 1))
+        # small (not zero) last-layer weights: beta starts ~anchor AND gradients flow
+        nn.init.normal_(self.mlp[-1].weight, std=1e-3); nn.init.zeros_(self.mlp[-1].bias)
+        self.register_buffer("mu", torch.zeros(()))
+        self.frozen_zero = False  # API parity with HomogeneousFog
+
+    def _phi(self, x: Tensor) -> Tensor:
+        """x [..., 3] world -> eps*tanh(f(x)) [..., 1]."""
+        lo, hi = self.aabb[0], self.aabb[1]
+        g = ((x - lo) / (hi - lo)).clamp(0, 1) * 2 - 1          # [-1, 1]
+        sh = g.shape[:-1]
+        g5 = g.reshape(1, -1, 1, 1, 3)
+        feats = [torch.nn.functional.grid_sample(
+            gr, g5, mode="bilinear", align_corners=True, padding_mode="border"
+        ).reshape(gr.shape[1], -1).T for gr in self.grids]
+        out = self.mlp(torch.cat(feats, dim=-1))
+        return (self.eps * torch.tanh(out)).reshape(*sh, 1)
+
+    def forward(self, positions: Tensor) -> Tensor:
+        phi = self._phi(positions)
+        if self.training:
+            with torch.no_grad():
+                self.mu.lerp_(phi.mean().to(self.mu.dtype), self.mu_momentum)  # dtype-safe (autocast fp16 / test fp64)
+        return self.beta_anchor * torch.exp(phi - self.mu)
+
+    def _pre(self, x: Tensor) -> Tensor:
+        lo, hi = self.aabb[0], self.aabb[1]
+        g = ((x - lo) / (hi - lo)).clamp(0, 1) * 2 - 1
+        g5 = g.reshape(1, -1, 1, 1, 3)
+        feats = [torch.nn.functional.grid_sample(
+            gr, g5, mode="bilinear", align_corners=True, padding_mode="border"
+        ).reshape(gr.shape[1], -1).T for gr in self.grids]
+        return self.mlp(torch.cat(feats, dim=-1))
+
+    def tv(self, n: int = 4096, delta: float = 2.0) -> Tensor:
+        """R1': TV smoothness + tanh-saturation penalty. Without the second term the optimizer
+        drifts the pre-activation to saturation (tanh' -> 0), freezing the field FLAT while the
+        parameters blow up (observed in P3 round 5: grids absmax 7, output constant)."""
+        lo, hi = self.aabb[0], self.aabb[1]
+        x = lo + (hi - lo) * torch.rand(n, 3, device=lo.device)
+        d = torch.nn.functional.normalize(torch.randn(n, 3, device=lo.device), dim=-1) * delta
+        tv = (self(x + d) - self(x)).abs().mean() / delta
+        act = (self._pre(x) ** 2).mean()
+        return tv + 0.1 * act
