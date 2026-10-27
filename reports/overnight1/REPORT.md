@@ -396,3 +396,19 @@ P3 ROUND 3 (V2d anchor-forever x3 seeds + V2e trusted-off; job 3759745, evals 37
   AND rgb-off reasonable, jointly. No variant achieves both yet.
 ROUND 4 (job 3762732): V2f = beta AND A double-anchored at the measurements (0.0321 / 0.544),
  trusted OFF, no mixture, R2 on; x3 seeds + V2h (= V2f with trusted ON).
+
+---
+P3 ROUND 4 (V2f double-anchor x3 seeds + V2h trusted-on; jobs 3766540, eval 3767419)
+ V2f: CLEAN SEPARATION - dark-beta(medium-off) 0.0034/0.0046/0.0055, BELOW the clear-method
+  floor 0.0077, consistent across seeds. (G4 interpretation corrected: rgb-off is the DEFOGGED
+  COUNTERFACTUAL scored against FOGGY GT - low PSNR there is expected, not damage; quality is
+  judged on rgb-ON + the defogged render's structure/visuals.)
+ Remaining gap: rgb-ON 18.8-19.0, ~6 dB below V2b -> RIGIDITY: a single global (beta, A) cannot
+  fit real heterogeneous fog (A4: NFF-15 has the largest sweep-to-sweep halo variance; lidar
+  intensity RMSE stuck at 0.102 for the same reason). Earlier rounds hid this mismatch in
+  beta/A drift or appearance absorption; the double anchor exposes it as pure expressiveness.
+ V2h reconfirms: trusted heuristic mask harms the near bin (0.110 vs 0.048) under pinned
+  transport too -> trusted mask OFF in the method until the pi_F version works.
+CONVERGED NEXT STEP = the plan's own §5.1: spatial field beta(x) = beta_anchor *
+ exp(eps*tanh(f(x)) - mu) with mean-normalisation (global scale stays anchored) + R1 TV.
+ The investigation reached it with an evidence chain rather than by assumption.
