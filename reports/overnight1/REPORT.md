@@ -381,3 +381,18 @@ ROUND 3 (job 3757574): ANCHOR-FOREVER - beta pinned at the dark-channel measurem
  for the entire run (defensible as calibration, like camera intrinsics); appearance gains
  nothing from absorbing fog. V2d (+2 seeds) and V2e (= V2d, trusted mask OFF) to isolate the
  near-bin regression.
+
+---
+P3 ROUND 3 (V2d anchor-forever x3 seeds + V2e trusted-off; job 3759745, evals 3762711)
+ V2e: trusted mask OFF fixes the near bin (0-10 m >5 m 0.0504 vs 0.115 masked; B0 0.042),
+  best geometry of the round (median 0.486) -> the heuristic mask harms once a medium exists;
+  pi_F-based masking must wait for a working in-loop mixture.
+ V2d (beta pinned 0.0321, 3 seeds): rgb 22.7-23.2 (WORSE than V2b's 25.2 at beta 0.0105) and
+  medium-off dark-beta STILL 0.019-0.025. Learned A drifted to 0.34 vs measured 0.544 ->
+  (beta pinned, A low) still leaves the appearance an absorption path: BOTH measured
+  quantities must be anchored.
+ G4 CRITERION REVISED: round-1 V2's dark-beta ~= 0 came with rgb-off 14.7 / LPIPS 0.78 -
+  "no appearance" also has no dark-channel gradient. True separation = dark-beta-off low
+  AND rgb-off reasonable, jointly. No variant achieves both yet.
+ROUND 4 (job 3762732): V2f = beta AND A double-anchored at the measurements (0.0321 / 0.544),
+ trusted OFF, no mixture, R2 on; x3 seeds + V2h (= V2f with trusted ON).
