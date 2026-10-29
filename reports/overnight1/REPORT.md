@@ -430,3 +430,26 @@ SESSION HANDOVER NOTE (2026-10-29): a parallel session (post-logoff continuation
  schedule on the congested preemptable queue, requeue-safe), plus: V2m = mixture with
  REAL-calibrated theta 1.43e-5 (lidar_probe) and pinned eta; N13med/N13ref = NFF-13 extension
  with its own anchors (beta 0.009, A 0.58 per A4). Adopted as-is; this session resumes waiting.
+
+---
+PHYSICS DESIGN NOTE (user/advisor directive: ground the LiDAR model in NFL/DyNFL, not guesses)
+Mapping of our model to NFL (Neural LiDAR Fields, ICCV'23):
+  - our E_S = a_S * T^2 * K(D) IS NFL's active-sensor amplitude equation (round-trip
+    transmittance, receiver response K(s)=1/(s^2+s0^2) finite at 0);
+  - our {surface, fog-bin, no-return} selection generalises NFL's {1st return, 2nd return,
+    drop} to a participating medium; theta plays NFL's detection-threshold role (now calibrated
+    on real clear data: 1.43e-5 matching the observed 12.5% below-horizon drop rate);
+  - DyNFL's contribution (dynamic SDF composition) maps to P4 actor handling (SplatAD-style
+    actors + the same medium, per the advisor's dynamics guidance).
+Principled NFL-style upgrades queued by value:
+  U1 incidence-factor intensity: a_S = rho * max(0, -d.n)^gamma with NeuRAD's own normals ->
+     a physical, defoggable reflectance (fixes the flat/implausible defogged intensity);
+  U2 beam divergence: k sub-rays per beam composited (NFL) - edge/mixed returns;
+  U3 dual-return supervision where the range images carry second returns.
+SKY IDENTIFIABILITY FIX (implemented, flag sky_radiance_prior_weight): in thick fog
+  T(sky) -> 0 leaves the sky sample's radiance unconstrained -> it drifts to noise and ruins
+  the medium-off counterfactual (the black/purple skies in the defog panels). Honest physics:
+  fog removal cannot invent clear-sky radiance; prior c_sky ~= observed pixel on sky-dominant
+  rays. Goes into the FINAL recipe run.
+LiDAR viz corrected to the bench returns-only convention (GT ray unit dir x predicted depth,
+  frame-independent) + in-figure intensity stats.
