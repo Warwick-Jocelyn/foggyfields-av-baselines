@@ -423,3 +423,10 @@ P3 ROUND 5 (V2s spatial field x3 + tv0; jobs 3767490, eval 3768584)
  result. TV=0 ablation: same flatness -> TV was not the cause.
  FIX (round 6, V2t): R1' = TV + 0.1 * mean(pre_tanh^2) saturation penalty; medium lr 1e-2 ->
  3e-3. Unit suite extended (9/9).
+
+---
+SESSION HANDOVER NOTE (2026-10-29): a parallel session (post-logoff continuation) cancelled the
+ stalled round-6 batch and requeued the SAME configs as 1-GPU single-variant jobs (faster to
+ schedule on the congested preemptable queue, requeue-safe), plus: V2m = mixture with
+ REAL-calibrated theta 1.43e-5 (lidar_probe) and pinned eta; N13med/N13ref = NFF-13 extension
+ with its own anchors (beta 0.009, A 0.58 per A4). Adopted as-is; this session resumes waiting.
