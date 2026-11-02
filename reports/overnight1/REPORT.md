@@ -453,3 +453,16 @@ SKY IDENTIFIABILITY FIX (implemented, flag sky_radiance_prior_weight): in thick 
   rays. Goes into the FINAL recipe run.
 LiDAR viz corrected to the bench returns-only convention (GT ray unit dir x predicted depth,
   frame-independent) + in-figure intensity stats.
+
+---
+P3 ROUND 6 RESULT (V2t spatial + saturation penalty, 3 seeds + TV ablation)
+ The saturation penalty works: the field is no longer flat. TV weight matters:
+   TV=0.5 (V2t, V2t-s1): p10-p90 only 0.038-0.041, rgb 21.0 - over-smoothed back toward flat.
+   TV=0.05 (V2t-tv0): p10-p90 = 0.024-0.053 (REAL spatial structure, mean 0.044), rgb-on
+   22.04/.804/.299, separation HELD (dark-beta-off 0.005 < clear floor 0.0077),
+   lidar 0-10m 0.052, intRMSE 0.096.
+ => under the TRUE-separation constraint the quality frontier moved 19.0 (V2f homogeneous)
+    -> 22.0 (+3 dB) via spatial freedom. Gap to the non-separating V2b (25.2) now 3.2 dB.
+ Working recipe so far: double anchor + spatial beta(x) + TV 0.05 + saturation penalty + R2
+ + trusted OFF + gain pinned (+ sky prior, in SYNfog run). N13med eval + N13ref/V2m/SYNfog
+ training still queued.
