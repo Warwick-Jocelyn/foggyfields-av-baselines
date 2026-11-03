@@ -72,3 +72,13 @@
 - **DyNFL** 的动态组合 + **SplatAD** 的 actor 处理 → P4 路线（MediumIntegrator 为 backbone
   无关的逐射线 LUT, 可直接乘进 SplatAD 光栅化 fragment——§5.6 插件）
 - 升级队列: U1 入射角反射率 a_S=ρ·cos^γ(用 NeuRAD 法线), U2 光束发散, U3 双回波
+
+---
+## FINAL NOTE (2026-11-03) — this architecture is CLOSED
+Phase 1 (this document) is kept as the feasibility study. Verdict: the medium/transport/
+mixture layer is validated (P2 2–4% β recovery; real-data separation V2t-tv0 22.0 PSNR
+with dark-β 0.005; specificity β→0.0054 on near-clear at 0.1 dB cost), but bolting it
+onto NeuRAD's feature-CNN pipeline caps quality architecturally (seesaw: −4.7 dB for
+true separation; in-loop mixture destabilizes geometry). Successor design: physics-first
+NFL/DyNFL-style model — requirements R1–R6, lessons, calibrations and reusable assets in
+`HANDOFF_PHYSICS_V2.md`; condensed results in `reports/overnight1/REPORT.md`.
