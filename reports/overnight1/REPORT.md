@@ -21,9 +21,13 @@ handoff for the new design: `../../HANDOFF_PHYSICS_V2.md`.
 **Closing evidence (SYNfog, the only run with true defog GT):** trained jointly on
 synthetic β=0.06 fog, the model reconstructs the foggy observation at 30.8 PSNR, but
 after the anchor is released β collapses to 0.0025 and the defogged render scores only
-**9.7 PSNR / 0.54 LPIPS against the true clear images** — with ground truth available,
-the data-driven decomposition is quantifiably poor. This is the cleanest single number
-behind the pivot.
+**9.7 PSNR / 0.54 LPIPS against the true clear images — below the 11.4 PSNR of the
+foggy observation itself (the do-nothing baseline)**: zero defog gain with ground truth
+available. This is the cleanest single number behind the pivot. (Fairness caveat: this
+run used a single released anchor; a double-anchored variant would hold β=0.06 by
+construction but pay the known ~4-7 dB homogeneity/fidelity cost — not run, phase closed.
+Note: lane-generated videos render the CNN path, which is UNSUPERVISED under
+rgb_supervision=rgb_ray and outputs garbage colors — judge only rgb_ray renders.)
 
 4. **The cap is architectural, not a tuning failure**: NeuRAD/SplatAD render *features
    through a CNN*, not radiance; density is a reconstruction proxy, not σ_t; LiDAR
