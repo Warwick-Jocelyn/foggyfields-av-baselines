@@ -88,14 +88,20 @@ Workspace: /capstor/scratch/cscs/yitiwang/foggyfields (symlink ~/foggyfields)
 - Reference papers in play: NFL (Huang et al.), DyNFL, NeuRAD, SplatAD, Hahner fog sim,
   LISA (note its one-way intensity convention).
 
-## 7. Key numbers to beat / reference
-NFF-15: V0 26.68 PSNR (no medium) · V2t-tv0 22.04 with TRUE separation · LiDAR median
-err 0.55 m, intRMSE 0.096 · bench baseline B0 (CNN path) ≈ 30 PSNR / NN med 0.19–0.26 m.
+## 7. Key numbers to beat / reference (post-audit 2026-11-03)
+NFF-15: V0 26.68 PSNR, LiDAR median 0.387 m, intRMSE 0.057 (no medium — note: Phase-1
+medium variants DEGRADED LiDAR to 0.54 m / 0.10). V2b 25.2 = visually-valid defog but
+no metric separation; V2f/V2t-tv0 "separation" is partly a dark-channel artifact (their
+defog renders are visually invalid). bench B0 (CNN path) ≈ 30 PSNR / NN med 0.19–0.26 m.
+WARNING for v2 evals: do not use dark-channel-off alone as the separation criterion —
+it rewards dark renders; require visual validity + synthetic-GT defog scores. Phase-1
+gain was learnable in V2f/V2t*/V2m/N13med (drift up to 1670×): their intensity numbers
+are not attenuation physics.
 NFF-13: ref 28.88/0.20 m. Specificity cost of medium: ≤0.1 dB. P2: β to 2–4%.
 SYNfog (synthetic fog, TRUE clear GT): Phase-1 joint training fits the fog obs at 30.8
 PSNR but defog-vs-clear-GT is only **9.7 PSNR / 0.54 LPIPS, below the 11.4 do-nothing baseline** (beta collapsed post-release)
 — the quantitative proof that data-driven decomposition fails; v2 must beat this by a
 wide margin on the same clip (data_fogsim NCF02F-Hb060, --defog-gt-root eval).
-v2 succeeds if it holds separation (dark-β ≤ floor) at ≤1–2 dB cost instead of 4.7,
+v2 succeeds if it achieves a VISUALLY VALID defog that also passes separation (dark-β ≤ floor AND intact sky/scene, plus defog-vs-GT on synthetic) at ≤1–2 dB cost,
 AND improves fog-clip LiDAR (fewer halo returns explained as surface, correct drop
 rate by range bin — see analysis/A2 classes).

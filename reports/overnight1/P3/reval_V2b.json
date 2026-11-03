@@ -1,0 +1,43 @@
+{
+ "config": "/capstor/scratch/cscs/yitiwang/foggyfields/p3/V2b/neurad-foggy/safe/NFF-15/neurad-foggy_safe_NFF-15/neurad-foggy/2026-10-26_173825/config.yml",
+ "step": 29999,
+ "medium": true,
+ "fitted": {
+  "beta0": 0.010329250246286392,
+  "airlight": [
+   0.29603469371795654,
+   0.29506346583366394,
+   0.28516077995300293
+  ],
+  "gain": 115.141357421875
+ },
+ "rgb_ray_medium_on": {
+  "psnr": 25.262281958633167,
+  "ssim": 0.8307486921548843,
+  "lpips": 0.277130260442694
+ },
+ "rgb_ray_medium_off": {
+  "psnr": 15.685367580754624,
+  "ssim": 0.7386460527777672,
+  "lpips": 0.4036069264014562
+ },
+ "defog_vs_true_clear": null,
+ "dark_channel_beta_medium_off": 0.01912527158856392,
+ "lidar": {
+  "n_rays": 6023597,
+  "median_err": 0.5368690490722656,
+  "frac_gt1m": 0.3652696221211346,
+  "frac_gt5m": 0.13873836513299279,
+  "intensity_rmse": 0.10361696852618556,
+  "false_near_mass": 0.0026810659661773216,
+  "gt1m_0-10": 0.3476424897943525,
+  "gt5m_0-10": 0.11615256681342338,
+  "gt1m_10-30": 0.27148154067824776,
+  "gt5m_10-30": 0.08332999525265437,
+  "gt1m_30-60": 0.4734681235729257,
+  "gt5m_30-60": 0.19435901006565043,
+  "gt1m_60-120": 0.6272464863339495,
+  "gt5m_60-120": 0.3546405263145308
+ },
+ "notes": "rgb at ray res (center-pixel GT); lidar depth is medium-independent (geometry); dark-channel residual beta: clear-method floor is 0.0077"
+}
