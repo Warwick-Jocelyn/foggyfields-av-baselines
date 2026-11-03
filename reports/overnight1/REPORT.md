@@ -18,6 +18,13 @@ handoff for the new design: `../../HANDOFF_PHYSICS_V2.md`.
    backbone's appearance is exactly where fog hides.
 3. **It does not hallucinate**: on near-clear data the released medium converges to
    β=0.0054 (below its own anchor) at a specificity cost of only 0.1 dB.
+**Closing evidence (SYNfog, the only run with true defog GT):** trained jointly on
+synthetic β=0.06 fog, the model reconstructs the foggy observation at 30.8 PSNR, but
+after the anchor is released β collapses to 0.0025 and the defogged render scores only
+**9.7 PSNR / 0.54 LPIPS against the true clear images** — with ground truth available,
+the data-driven decomposition is quantifiably poor. This is the cleanest single number
+behind the pivot.
+
 4. **The cap is architectural, not a tuning failure**: NeuRAD/SplatAD render *features
    through a CNN*, not radiance; density is a reconstruction proxy, not σ_t; LiDAR
    intensity is a non-radiometric readout. A medium bolted onto that pipeline can only
@@ -34,7 +41,7 @@ handoff for the new design: `../../HANDOFF_PHYSICS_V2.md`.
 | V2m | + in-loop return mixture | 21.8/.807/.496 | over-corrects (−0.010) | **1.11** / 0.106 → FAIL |
 | N13med (near-clear) | specificity | 28.77/.852/.151 | β→0.0054 (no hallucination) | 0.21 / 0.079 |
 | N13ref (near-clear) | reference | 28.88/.857/.148 | — | 0.20 / 0.057 |
-| SYNfog (synthetic β=0.06) | defog vs TRUE clear GT | eval_SYNfog/results.json (defog_vs_true_clear) | the only run with real defog GT | — |
+| SYNfog (synthetic β=0.06) | defog vs TRUE clear GT | 30.8/.898/.135 (fits fog obs well) | ✗ β collapsed 0.06→0.0025 after anchor release; **defog vs clear GT = 9.7 PSNR / 0.54 LPIPS** | — |
 
 P2 controlled inversion (frozen scene, synthetic fog): camera β error 2–4% (both
 simulators), LiDAR −12% (Hahner convention), β(t) ramp 6–17%, A to 0.75 of truth;
