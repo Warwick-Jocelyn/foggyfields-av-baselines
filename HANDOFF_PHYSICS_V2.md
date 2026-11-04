@@ -100,8 +100,8 @@ are not attenuation physics.
 NFF-13: ref 28.88/0.20 m. Specificity cost of medium: ≤0.1 dB. P2: β to 2–4%.
 SYNfog (synthetic fog, TRUE clear GT): Phase-1 joint training fits the fog obs at 30.8
 PSNR but defog-vs-clear-GT is only **9.7 PSNR / 0.54 LPIPS, below the 11.4 do-nothing baseline** (beta collapsed post-release)
-— the quantitative proof that data-driven decomposition fails; v2 must beat this by a
-wide margin on the same clip (data_fogsim NCF02F-Hb060, --defog-gt-root eval).
+— the quantitative proof that data-driven decomposition fails. (2026-11-04 user decision:
+v2 uses REAL data only; the synthetic defog-GT eval is a LAST RESORT, never training data.)
 v2 succeeds if it achieves a VISUALLY VALID defog that also passes separation (dark-β ≤ floor AND intact sky/scene, plus defog-vs-GT on synthetic) at ≤1–2 dB cost,
 AND improves fog-clip LiDAR (fewer halo returns explained as surface, correct drop
 rate by range bin — see analysis/A2 classes).
