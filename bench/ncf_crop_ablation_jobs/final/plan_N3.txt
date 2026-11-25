@@ -1,36 +1,37 @@
-0 neurad NFF-02
-0 emernerf NFF-10
+0 viz3d NFF-02 SplatAD /capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_final/allfix/splatad/safe/NFF-02/splatad_safe_NFF-02/splatad/2026-11-24_043308/config.yml
+0 viz3d NFF-02 V1.3-BRDF_C7gR /capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261119_2030_NFF-02_v13_mat/train/V13-C7gR/V13-C7gR/neurad-fog-v13-5k/run/config.yml
+0 emernerf NFF-02
 0 neurad NFF-08
 0 unisim NFF-08
 0 unisim NFF-10
 0 neurad NFF-10
-0 emernerf NFF-02
 0 emernerf NFF-08
 0 unisim NFF-02
-1 emernerf NFF-02
-1 emernerf NFF-10
+0 emernerf NFF-10
+1 viz3d NFF-02 NeuRAD /capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_final/std/neurad/safe/NFF-02/neurad_safe_NFF-02/neurad/2026-11-25_010653/config.yml
+1 emernerf NFF-08
 1 neurad NFF-08
 1 unisim NFF-08
 1 unisim NFF-10
 1 neurad NFF-10
-1 neurad NFF-02
-1 emernerf NFF-08
+1 emernerf NFF-02
 1 unisim NFF-02
-2 emernerf NFF-08
-2 emernerf NFF-10
+1 emernerf NFF-10
+2 viz3d NFF-02 UniSim /capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_final/std/unisim/safe/NFF-02/unisim_safe_NFF-02/unisim/2026-11-25_161144/config.yml
+2 unisim NFF-02
 2 neurad NFF-08
 2 unisim NFF-08
 2 unisim NFF-10
 2 neurad NFF-10
-2 neurad NFF-02
 2 emernerf NFF-02
-2 unisim NFF-02
-3 unisim NFF-02
+2 emernerf NFF-08
+2 emernerf NFF-10
+3 viz3d NFF-02 V1.3-Colour_UcnnR /capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261123_NFF-02_v13_final/train/V13-UcnnR/V13-UcnnR/neurad-fog-v13-5k/run/config.yml
 3 emernerf NFF-10
 3 neurad NFF-08
 3 unisim NFF-08
 3 unisim NFF-10
 3 neurad NFF-10
-3 neurad NFF-02
 3 emernerf NFF-02
 3 emernerf NFF-08
+3 unisim NFF-02

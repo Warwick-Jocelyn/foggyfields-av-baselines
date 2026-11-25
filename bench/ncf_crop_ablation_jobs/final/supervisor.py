@@ -35,6 +35,33 @@ DEADLINE = time.time() + 4 * 86400
 LANES = [("neurad", "NFF-02"), ("emernerf", "NFF-02"), ("emernerf", "NFF-08"), ("unisim", "NFF-02"),
          ("emernerf", "NFF-10"), ("neurad", "NFF-08"), ("unisim", "NFF-08"), ("unisim", "NFF-10"), ("neurad", "NFF-10")]
 DYN_PLANS = ["A", "B", "C", "D2", "D3", "N1", "N2", "N3", "N4", "N5", "P"]
+# 3D 360-deg orbit videos (jobs/final/viz3d_orbit.py, lane kind viz3d) on one clip, enabled by the flag file after the smoke test
+VIZ_CLIP = "NFF-02"
+VIZ_DIR = Path("/users/yitiwang/FoggyfieldV1/RGB_branch_3D_viz")
+VIZ_FLAG = JF / ".viz3d_enabled"
+V13_VIZ = {"V1.3-Colour_UcnnR": "/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261123_NFF-02_v13_final/train/V13-UcnnR/V13-UcnnR/neurad-fog-v13-5k/run/config.yml",
+           "V1.3-BRDF_C7gR": "/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261119_2030_NFF-02_v13_mat/train/V13-C7gR/V13-C7gR/neurad-fog-v13-5k/run/config.yml"}
+
+
+def viz_lanes():
+    out = []
+    for lb, td in (("SplatAD", OUT / "allfix/splatad/safe" / VIZ_CLIP / "TRAIN_DONE"), ("NeuRAD", OUT / "std/neurad/safe" / VIZ_CLIP / "TRAIN_DONE"),
+                   ("UniSim", OUT / "std/unisim/safe" / VIZ_CLIP / "TRAIN_DONE")):
+        try:
+            cfg = td.read_text().splitlines()[0].strip()
+            if cfg.endswith("config.yml") and Path(cfg).is_file():
+                out.append((lb, cfg))
+        except Exception:
+            pass
+    if (OUT / "std/emernerf/safe" / VIZ_CLIP / "TRAIN_DONE").is_file():
+        out.append(("EmerNeRF", str(OUT / "std/emernerf/safe" / VIZ_CLIP / "train/run")))
+    out += [(lb, c) for lb, c in V13_VIZ.items() if Path(c).is_file()]
+    return out
+
+
+def viz_done(lb):
+    d = VIZ_DIR / VIZ_CLIP / lb
+    return (d / "meta.json").is_file() and any(d.glob("orbit360_*.mp4"))
 
 
 def log(msg):
@@ -83,6 +110,9 @@ def failures(since):
                 ts, _, k, c, rc = m.groups(); rc = int(rc)
                 if rc in (0, 75, 143):
                     continue
+                if k == "viz3d":
+                    mv = re.search(r"lane viz3d NFF-\d\d (\S+) ", ln)
+                    k = "viz3d:" + (mv.group(1) if mv else "?")
             else:
                 m = ENV_RE.match(ln)
                 if m:
@@ -99,11 +129,14 @@ def failures(since):
     return f
 
 
-def plan_text(rem):
-    if not rem:
+def plan_text(rem, viz=()):
+    if not rem and not viz:
         return ""
     rows = []
     for g in range(4):
+        rows += [f"{g} viz3d {VIZ_CLIP} {lb} {cfg}" for j, (lb, cfg) in enumerate(viz) if j % 4 == g]
+        if not rem:
+            continue
         order = [rem[g % len(rem)]] + rem[4:] + [rem[j] for j in range(min(4, len(rem))) if j != g % len(rem)]
         seen = []
         for l in order:
@@ -118,8 +151,8 @@ def owner_alive(plan):
     return hb.is_file() and time.time() - hb.stat().st_mtime < 300
 
 
-def write_plans(rem):
-    txt = plan_text(rem)
+def write_plans(rem, viz=()):
+    txt = plan_text(rem, viz)
     for p in DYN_PLANS:
         f = JF / f"plan_{p}.txt"
         if f.is_file() and f.read_text() == txt:
@@ -157,6 +190,9 @@ def submit(acct, part, tl, name, plan, chain):
 
 
 def publish(rem, excl, fails, q, final=False):
+    sh(["env", "OPENBLAS_NUM_THREADS=4", PY, "-I", str(JF / "convergence_check.py"), "--out-md", str(DST / "baselines/CONVERGENCE.md"),
+        "--out-json", str(DST / "baselines/convergence.json")], timeout=1800)
+    viz_index()
     sh([PY, "-I", str(JF / "build_table.py"), "--write", str(REP)])
     sh(["bash", str(JF / "publish_metrics.sh")])
     sh(["bash", str(JF / "copy_figs.sh")])
@@ -180,6 +216,29 @@ def publish(rem, excl, fails, q, final=False):
     (DST / "STATUS.md").write_text("\n".join(L) + "\n")
 
 
+def viz_index():
+    L = ["# RGB_branch_3D_viz — 360-degree orbit videos of every reconstructed scene (auto-updated by supervisor.py)", "",
+         f"Clip {VIZ_CLIP}, camera front_wide_120fov, middle held-out timestep (time frozen, actors frozen). Frame 0 = the REAL",
+         "held-out camera (compare with `frame0_vs_gt_*.jpg`: render vs GT, PSNR printed); then the camera orbits 360 deg around a",
+         "point 8 m ahead, rising to +4 m at the far side. Left = model RGB, right = model expected depth (log 1-80 m, red = near, blue = far or empty).",
+         "What to look for: road/kerbs/poles stay straight and in place while the view rotates (correct 3D); floaters, grey",
+         "fog-blobs in free space, or a scene that only looks right at frame 0 = overfitted / wrong geometry.",
+         "Renderer: `/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/jobs/final/viz3d_orbit.py` (lane kind viz3d in node_final.sh).", "",
+         "| method | video | frame-0 PSNR vs GT (0.5x) | median depth range over orbit (m) | checkpoint step |", "|---|---|---|---|---|"]
+    for lb in ["SplatAD", "NeuRAD", "UniSim", "EmerNeRF", "V1.3-Colour_UcnnR", "V1.3-BRDF_C7gR"]:
+        d = VIZ_DIR / VIZ_CLIP / lb
+        try:
+            m = json.loads((d / "meta.json").read_text())
+            vids = " ".join(f"[{p.name}]({VIZ_CLIP}/{lb}/{p.name})" for p in sorted(d.glob("orbit360_*.mp4")))
+            dr = m.get("depth_median_m_min_max")
+            L.append(f"| {lb} | {vids} | {m['frame0_psnr_vs_gt_db']:.2f} dB | {dr[0]:.1f}-{dr[1]:.1f} | {m['step']} |" if dr else
+                     f"| {lb} | {vids} | {m['frame0_psnr_vs_gt_db']:.2f} dB | - | {m['step']} |")
+        except Exception:
+            L.append(f"| {lb} | pending (renders once the method is trained{'; EmerNeRF renderer still to be written' if lb == 'EmerNeRF' else ''}) | | | |")
+    VIZ_DIR.mkdir(parents=True, exist_ok=True)
+    (VIZ_DIR / "README.md").write_text("\n".join(L) + "\n")
+
+
 def main():
     if PIDF.is_file():
         try:
@@ -196,11 +255,13 @@ def main():
         fails = failures(s["since"])
         excl = {l for l in LANES if not done(*l) and fails.get(l, 0) >= MAX_FAIL}
         rem = [l for l in LANES if not done(*l) and l not in excl]
-        write_plans(rem)
+        viz = [v for v in viz_lanes() if VIZ_FLAG.is_file() and not viz_done(v[0])
+               and fails.get(("viz3d:" + v[0], VIZ_CLIP), 0) < MAX_FAIL]
+        write_plans(rem, viz)
         q = queue()
         if q is not None:
             fb = [r for r in q if r[2].startswith("finalbase")]
-            if not rem:
+            if not rem and not viz:
                 for r in fb:
                     if r[3] == "PENDING":
                         sh(["scancel", r[0]]); log(f"all lanes finished -> cancelled pending {r[0]} {r[2]}")

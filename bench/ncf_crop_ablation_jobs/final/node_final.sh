@@ -90,6 +90,23 @@ one(){  # gpu kind args...
         sleep 60
       done
       wait $PP 2>/dev/null; rc=0 ;;
+    viz3d)  # c = clip, $1 = label, $2 = config.yml : 360-deg orbit video (jobs/final/viz3d_orbit.py) -> RGB_branch_3D_viz
+      local lb=$1 cfg=$2 vd=/users/yitiwang/FoggyfieldV1/RGB_branch_3D_viz/$c/$1
+      mkdir -p "$BW/logs_final/viz3d" "$vd"; local vl=$BW/logs_final/viz3d/${lb}__$c.log
+      { echo; echo "######## $(date -Is) job $SLURM_JOB_ID gpu $g viz3d $lb $c cfg $cfg ########"; } >> "$vl"
+      if [ -s "$vd/meta.json" ] && ls "$vd"/orbit360_*.mp4 >/dev/null 2>&1; then say "viz3d $lb $c already done"; rc=0
+      elif [ ! -e "$cfg" ]; then say "!! viz3d config missing: $cfg"; rc=2
+      elif ! mkdir "$vd/.lock" 2>/dev/null && [ $(( $(date +%s) - $(stat -c %Y "$vd/.lock" 2>/dev/null || echo 0) )) -lt 3000 ]; then
+        say "viz3d $lb $c BUSY (another job renders it)"; rc=75
+      else
+        touch "$vd/.lock"
+        case "$cfg" in
+          */emernerf/safe/*/train/run) run_bg timeout 2700 bash -c "source '$BW/jobs/emernerf/env_emernerf.sh' && cd '$BW/code/emernerf' && exec \"\$EMER_PY\" '$BW/jobs/final/viz3d_orbit_emernerf.py' --run-dir '$cfg' --label '$lb' --clip '$c' --out '$vd'" >> "$vl" 2>&1; rc=$? ;;
+          */v13_overnight/*|*neurad-fog-v13*) run_bg timeout 2400 bash -c "source '$V13UNI/jobs/v13uni_env.sh' && cd '$V13UNI' && exec python '$BW/jobs/final/viz3d_orbit.py' --config '$cfg' --label '$lb' --clip '$c' --out '$vd'" >> "$vl" 2>&1; rc=$? ;;
+          *) run_bg timeout 2400 bash -c "source '$BW/jobs/final/config_final.sh' && source '$BW/jobs/env.sh' >/dev/null 2>&1 && cd '$NS_REPO' && exec python '$BW/jobs/final/viz3d_orbit.py' --config '$cfg' --label '$lb' --clip '$c' --out '$vd'" >> "$vl" 2>&1; rc=$? ;;
+        esac
+        rm -rf "$vd/.lock"
+      fi ;;
     *) say "!! unknown kind $k"; rc=2 ;;
   esac
   say "lane $k $c $* gpu $g rc=$rc"

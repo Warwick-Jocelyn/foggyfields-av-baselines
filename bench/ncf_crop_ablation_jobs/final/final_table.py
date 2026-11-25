@@ -35,18 +35,35 @@ def v13(*labels):  # first label that exists per clip (NFF-02 BRDF lane is named
     return f
 
 
-ROWS = [  # (name, group, iters, path fn)
-    ("SplatAD (allfix: opacity reg 5e-4 + F1b/F2b)", "SOTA", "30k", ext("allfix", "splatad")),
-    ("SplatAD (opreg5e4, pre-fix data path)", "SOTA", "30k", ext("opreg5e4", "splatad")),
-    ("NeuRAD (standard, corrected bench)", "SOTA", "30k", ext("std", "neurad")),
-    ("UniSim (corrected bench, no ray drop)", "SOTA", "20k", ext("std", "unisim")),
-    ("EmerNeRF (corrected bench)", "SOTA", "25k", ext("std", "emernerf")),
-    ("NeuRAD A0 (V1.3 suite, 5k)", "ours-suite", "5k", v13("A0")),
-    ("FoggyField V1.3 BRDF (U0 / C7gR)", "ours", "5k", v13("V13-U0", "V13-C7gR")),
-    ("FoggyField V1.3 Colour (UcnnR)", "ours", "5k", v13("V13-UcnnR")),
-    ("FoggyField V1.3 BRDF + LiDAR (F)", "ours", "5k", v13("V13-F")),
-    ("FoggyField V1.3 Colour + LiDAR (Fc)", "ours", "5k", v13("V13-Fc")),
+def v13key(*labels):
+    def f(c):
+        for lb in labels:
+            if (R / "v13" / "metrics" / f"metrics_v13__{lb}__{c}.json").is_file():
+                return f"v13-{lb}"
+        return f"v13-{labels[0]}"
+    return f
+
+
+ROWS = [  # (name, group, iters, path fn, convergence key fn)
+    ("SplatAD (allfix: opacity reg 5e-4 + F1b/F2b)", "SOTA", "30k", ext("allfix", "splatad"), lambda c: "splatad"),
+    ("SplatAD (opreg5e4, pre-fix data path)", "SOTA", "30k", ext("opreg5e4", "splatad"), lambda c: "splatad-opreg5e4"),
+    ("NeuRAD (standard, corrected bench)", "SOTA", "30k", ext("std", "neurad"), lambda c: "neurad"),
+    ("UniSim (corrected bench, no ray drop)", "SOTA", "20k", ext("std", "unisim"), lambda c: "unisim"),
+    ("EmerNeRF (corrected bench)", "SOTA", "25k", ext("std", "emernerf"), lambda c: "emernerf"),
+    ("NeuRAD A0 (V1.3 suite, 5k)", "ours-suite", "5k", v13("A0"), v13key("A0")),
+    ("FoggyField V1.3 BRDF (U0 / C7gR)", "ours", "5k", v13("V13-U0", "V13-C7gR"), v13key("V13-U0", "V13-C7gR")),
+    ("FoggyField V1.3 Colour (UcnnR)", "ours", "5k", v13("V13-UcnnR"), v13key("V13-UcnnR")),
+    ("FoggyField V1.3 BRDF + LiDAR (F)", "ours", "5k", v13("V13-F"), v13key("V13-F")),
+    ("FoggyField V1.3 Colour + LiDAR (Fc)", "ours", "5k", v13("V13-Fc"), v13key("V13-Fc")),
 ]
+CONV = Path("/users/yitiwang/FoggyfieldV1/RGB-Branch-Metrics/baselines/convergence.json")
+
+
+def verdicts():
+    try:
+        return {(r["method"], r["clip"]): r["verdict"] for r in json.loads(CONV.read_text())}
+    except Exception:
+        return {}
 METRICS = [  # (label, kind, key, higher_better, digits)
     ("PSNR ↑", "rgb", "psnr", True, 2), ("SSIM ↑", "rgb", "ssim", True, 3), ("LPIPS ↓", "rgb", "lpips", False, 3),
     ("LiDAR CD (m) ↓", "lidar", "cd_returns_m", False, 3), ("CD² (m²) ↓", "lidar", "cd2_returns_m2", False, 2),
@@ -77,7 +94,10 @@ def main():
            "No method's ray-drop head is used (oracle drop) so every row is scored on the same rays. Details + per-run wall time: "
            "`baselines/RESULTS_BASELINES.md`.", "",
            "**Budget caveat:** SOTA rows use their standard schedules (20–30k steps); V1.3 rows are 5k-step lanes. "
-           "Bold = best in the column (all rows).", ""]
+           "Bold = best in the column (all rows).", "",
+           "**Validation marks** (`baselines/CONVERGENCE.md`: finished, finite loss, loss plateau, train/held-out gap, renders not grey): "
+           "plain number = PASS; `⚠` = a check FAILED (do not cite without reading CONVERGENCE.md); `†` = not fully validated yet.", ""]
+    V = verdicts()
     for label, kind, key, hb, nd in METRICS:
         vals = {(r[0], c): value(r[3], c, kind, key) for r in ROWS for c in CLIPS}
         best = {}
@@ -100,7 +120,11 @@ def main():
                     cells.append("n/a")
                 else:
                     s = f"{v:.{nd}f}"
-                    cells.append(f"**{s}**" if best[c] is not None and abs(v - best[c]) < 1e-12 else s)
+                    s = f"**{s}**" if best[c] is not None and abs(v - best[c]) < 1e-12 else s
+                    if c != "mean":
+                        vd = V.get((r[4](c), c))
+                        s += "" if vd == "PASS" else (" ⚠" if vd == "FAIL" else " †")
+                    cells.append(s)
             if all(x == "n/a" for x in cells):
                 cells = ["n/a"] * len(cells)
             out.append(f"| {r[0]} | {r[1]} | {r[2]} | " + " | ".join(cells) + " |")
