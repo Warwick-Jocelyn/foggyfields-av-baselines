@@ -34,6 +34,12 @@ export V13_QUEUE=$BW/jobs/final/v13_queue.txt
 export LANES_MD=/users/yitiwang/projects/foggyfields-v1/reports/v13_overnight/final_ablation_2026-11-23/RESULTS_LANES.md
 # UniSim (plugin code/_src/unisim @ 86dcdee, as in fixbench/config.sh): paper config, no ray drop, U5b/U6/U6b fixes pinned.
 # The plugin is registered in venv_neurad by jobs/final/unisim_install.sh (editable, --no-deps) before the first UniSim lane.
-export UNISIM_EXTRA="--pipeline.model.lidar-decoder-fp32 True --pipeline.model.lidar-decoder-layernorm True --pipeline.model.sampler.occupancy-point-dilation True"
+# 2026-11-25 FAIR BUDGET (user: same steps for every method): every method trains 30 000 steps. UniSim's paper schedule
+# (stages 2500+7500+10001, schedulers 20001) is stretched x1.5 exactly as NeuRAD's was stretched to 30k.
+UNISIM_SCHED="--pipeline.steps-per-stage 3750 11250 15001"
+for _grp in trajectory_opt discriminator cnn fields camera_opt; do UNISIM_SCHED="$UNISIM_SCHED --optimizers.$_grp.scheduler.max-steps 30000"; done; unset _grp
+export UNISIM_EXTRA="--pipeline.model.lidar-decoder-fp32 True --pipeline.model.lidar-decoder-layernorm True --pipeline.model.sampler.occupancy-point-dilation True $UNISIM_SCHED"
 export UNISIM_DP_EXTRA="--use-range-image-raydrop False $FIX_DP"
-export UNISIM_ITERS=20001
+export UNISIM_ITERS=30000
+# EmerNeRF: 30 000 steps (was its default 25 000); its LR schedule follows optim.num_iters. node_final passes ITERS=$EMER_ITERS.
+export EMER_ITERS=30000

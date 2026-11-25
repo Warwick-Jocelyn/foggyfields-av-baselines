@@ -31,37 +31,105 @@ STATE = LOGS / "supervisor_state.json"
 PIDF = LOGS / "supervisor.pid"
 CYCLE, PUBLISH_EVERY, MAX_FAIL = 300, 900, 2
 DEADLINE = time.time() + 4 * 86400
-# priority order: short finishing work first, then the long untested/long lanes so each GPU starts on a different one
-LANES = [("neurad", "NFF-02"), ("emernerf", "NFF-02"), ("emernerf", "NFF-08"), ("unisim", "NFF-02"),
-         ("emernerf", "NFF-10"), ("neurad", "NFF-08"), ("unisim", "NFF-08"), ("unisim", "NFF-10"), ("neurad", "NFF-10")]
+CLIPS = ["NFF-02", "NFF-08", "NFF-10"]
+BUDGET = 30000          # 2026-11-25 user: every method trains the SAME number of steps (fair budget) -> 30k for all
+OV = Path("/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight")
+V13_LANES = {"F": "V1.3-BRDF+LiDAR_F", "Fc": "V1.3-Colour+LiDAR_Fc"}   # our full models at 30k (ablation parked)
 DYN_PLANS = ["A", "B", "C", "D2", "D3", "N1", "N2", "N3", "N4", "N5", "P"]
 # 3D 360-deg orbit videos (jobs/final/viz3d_orbit.py, lane kind viz3d) on one clip, enabled by the flag file after the smoke test
 VIZ_CLIP = "NFF-02"
 VIZ_DIR = Path("/users/yitiwang/FoggyfieldV1/RGB_branch_3D_viz")
 VIZ_FLAG = JF / ".viz3d_enabled"
-V13_VIZ = {"V1.3-Colour_UcnnR": "/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261123_NFF-02_v13_final/train/V13-UcnnR/V13-UcnnR/neurad-fog-v13-5k/run/config.yml",
-           "V1.3-BRDF_C7gR": "/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261119_2030_NFF-02_v13_mat/train/V13-C7gR/V13-C7gR/neurad-fog-v13-5k/run/config.yml"}
+VIZ_ORDER = ["SplatAD", "NeuRAD", "UniSim", "EmerNeRF"] + list(V13_LANES.values())
+
+
+def _json(p):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return None
+
+
+def sota_done(k, c):
+    """RGB metrics at the 30k budget AND a LiDAR JSON written after them."""
+    mp, lp = RES / "std/metrics" / f"metrics_{k}__safe__{c}.json", RES / "std/lidar" / f"lidar_{k}_safe__{c}.json"
+    m = _json(mp)
+    return bool(m) and int(m.get("iters") or 0) >= BUDGET and lp.is_file() and lp.stat().st_mtime >= mp.stat().st_mtime - 60
+
+
+def v13_dir(c, L):
+    return OV / f"20261123_{c}_v13_final30k" / "train" / f"V13-{L}"
+
+
+def v13_cfg(c, L):
+    cs = sorted(v13_dir(c, L).glob("*/*/*/config.yml"))
+    return str(cs[0]) if cs else None
+
+
+def v13_trained(c, L):
+    return (v13_dir(c, L) / "TRAIN_DONE").is_file()
+
+
+def v13_scored(c, L):
+    lb = f"V13-{L}30k"
+    return (RES / "v13/metrics" / f"metrics_v13__{lb}__{c}.json").is_file() and (RES / "v13/lidar" / f"lidar_v13__{lb}__{c}.json").is_file()
+
+
+def all_lanes():
+    """Every unit of work, in priority order (longest first). key = failure-count / status key, row = plan text after the GPU."""
+    L = []
+    for c in CLIPS:
+        L.append(dict(key=f"emernerf:{c}", row=f"emernerf {c}", done=sota_done("emernerf", c), ready=True, what=f"EmerNeRF {c} (30k)"))
+    for c in CLIPS:
+        for l in V13_LANES:
+            L.append(dict(key=f"v13train:{l}:{c}", row=f"v13train {c} {l}", done=v13_trained(c, l), ready=True,
+                          what=f"V1.3 {l} {c} train 30k"))
+    for c in CLIPS:
+        L.append(dict(key=f"unisim:{c}", row=f"unisim {c}", done=sota_done("unisim", c), ready=True, what=f"UniSim {c} (30k)"))
+    for c in ("NFF-08", "NFF-10", "NFF-02"):
+        L.append(dict(key=f"neurad:{c}", row=f"neurad {c}", done=sota_done("neurad", c), ready=True, what=f"NeuRAD {c} (30k)"))
+    for c in CLIPS:
+        for l in V13_LANES:
+            cfg = v13_cfg(c, l)
+            L.append(dict(key=f"v13:V13-{l}30k:{c}", row=f"v13 V13-{l}30k {c} {cfg}", done=v13_scored(c, l),
+                          ready=bool(v13_trained(c, l) and cfg), score=True, what=f"V1.3 {l} {c} score (common evaluator)"))
+    return L
 
 
 def viz_lanes():
     out = []
-    for lb, td in (("SplatAD", OUT / "allfix/splatad/safe" / VIZ_CLIP / "TRAIN_DONE"), ("NeuRAD", OUT / "std/neurad/safe" / VIZ_CLIP / "TRAIN_DONE"),
-                   ("UniSim", OUT / "std/unisim/safe" / VIZ_CLIP / "TRAIN_DONE")):
+
+    def td_cfg(p):   # TRAIN_DONE -> its config.yml, only when trained at the budget
         try:
-            cfg = td.read_text().splitlines()[0].strip()
-            if cfg.endswith("config.yml") and Path(cfg).is_file():
-                out.append((lb, cfg))
+            t = p.read_text().splitlines()
+            if any(f"iters={BUDGET}" in x for x in t) and t[0].strip().endswith("config.yml") and Path(t[0].strip()).is_file():
+                return t[0].strip()
         except Exception:
-            pass
-    if (OUT / "std/emernerf/safe" / VIZ_CLIP / "TRAIN_DONE").is_file():
+            return None
+    for lb, p in (("SplatAD", OUT / "allfix/splatad/safe" / VIZ_CLIP / "TRAIN_DONE"), ("NeuRAD", OUT / "std/neurad/safe" / VIZ_CLIP / "TRAIN_DONE"),
+                  ("UniSim", OUT / "std/unisim/safe" / VIZ_CLIP / "TRAIN_DONE")):
+        cfg = td_cfg(p)
+        if cfg:
+            out.append((lb, cfg))
+    if sota_done("emernerf", VIZ_CLIP):
         out.append(("EmerNeRF", str(OUT / "std/emernerf/safe" / VIZ_CLIP / "train/run")))
-    out += [(lb, c) for lb, c in V13_VIZ.items() if Path(c).is_file()]
+    for l, lb in V13_LANES.items():
+        if v13_trained(VIZ_CLIP, l) and v13_cfg(VIZ_CLIP, l):
+            out.append((lb, v13_cfg(VIZ_CLIP, l)))
     return out
 
 
 def viz_done(lb):
+    """meta.json + mp4 from a checkpoint at the budget; a stale (smaller-step) render is removed so it is redone."""
     d = VIZ_DIR / VIZ_CLIP / lb
-    return (d / "meta.json").is_file() and any(d.glob("orbit360_*.mp4"))
+    m = _json(d / "meta.json")
+    if m is None or not any(d.glob("orbit360_*.mp4")):
+        return False
+    if int(m.get("step") or 0) < BUDGET - 2:
+        for f in list(d.glob("*.mp4")) + list(d.glob("*.jpg")) + [d / "meta.json"]:
+            f.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def log(msg):
@@ -87,18 +155,19 @@ def save_state(s):
     tmp = STATE.with_suffix(".tmp"); tmp.write_text(json.dumps(s, indent=1)); tmp.replace(STATE)
 
 
-def done(kind, clip):
-    return (RES / "std/metrics" / f"metrics_{kind}__safe__{clip}.json").is_file() and \
-           (RES / "std/lidar" / f"lidar_{kind}_safe__{clip}.json").is_file()
-
-
-LANE_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[\S+ job (\d+)\] lane (\S+) (NFF-\d\d) .*rc=(\d+)")
-ENV_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[\S+ job (\d+)\] (emernerf) env repair failed rc=(\d+).*__(NFF-\d\d)\.log")
+LANE_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[\S+ job (\d+)\] lane (\S+) (\S+) ?(.*?)\s*gpu \d rc=(\d+)")
+ENV_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[\S+ job (\d+)\] emernerf env repair failed rc=(\d+).*__(NFF-\d\d)\.log")
 UNI_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[\S+ job (\d+)\] unisim plugin install failed rc=(\d+)")
 
 
 def failures(since):
+    """-> {lane key: number of real failures since `since`} (rc 0 ok, 75 busy, 143 wall-clock are not failures)."""
     f = {}
+
+    def add(ts, keys):
+        if time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S")) >= since:
+            for k in keys:
+                f[k] = f.get(k, 0) + 1
     for p in LOGS.glob("run_finalbase_*.log"):
         try:
             lines = p.read_text(errors="replace").splitlines()
@@ -107,42 +176,36 @@ def failures(since):
         for ln in lines:
             m = LANE_RE.match(ln)
             if m:
-                ts, _, k, c, rc = m.groups(); rc = int(rc)
-                if rc in (0, 75, 143):
+                ts, _, k, a1, rest, rc = m.groups()
+                if int(rc) in (0, 75, 143):
                     continue
-                if k == "viz3d":
-                    mv = re.search(r"lane viz3d NFF-\d\d (\S+) ", ln)
-                    k = "viz3d:" + (mv.group(1) if mv else "?")
-            else:
-                m = ENV_RE.match(ln)
-                if m:
-                    ts, _, k, rc, c = m.groups()
-                else:
-                    m = UNI_RE.match(ln)
-                    if not m:
-                        continue
-                    ts, _, rc = m.groups(); k, c = "unisim", "*"
-            if time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S")) < since:
-                continue
-            for cc in (["NFF-02", "NFF-08", "NFF-10"] if c == "*" else [c]):
-                f[(k, cc)] = f.get((k, cc), 0) + 1
+                r1 = rest.split()[0] if rest.split() else ""
+                key = {"viz3d": f"viz3d:{r1}:{a1}", "v13train": f"v13train:{r1}:{a1}", "v13": f"v13:{a1}:{r1}"}.get(k, f"{k}:{a1}")
+                add(ts, [key]); continue
+            m = ENV_RE.match(ln)
+            if m:
+                add(m.group(1), [f"emernerf:{m.group(4)}"]); continue
+            m = UNI_RE.match(ln)
+            if m:
+                add(m.group(1), [f"unisim:{c}" for c in CLIPS])
     return f
 
 
-def plan_text(rem, viz=()):
-    if not rem and not viz:
+def plan_text(rem, viz=(), score=()):
+    if not rem and not viz and not score:
         return ""
     rows = []
     for g in range(4):
         rows += [f"{g} viz3d {VIZ_CLIP} {lb} {cfg}" for j, (lb, cfg) in enumerate(viz) if j % 4 == g]
+        rows += [f"{g} {r}" for j, r in enumerate(score) if j % 4 == g]
         if not rem:
             continue
         order = [rem[g % len(rem)]] + rem[4:] + [rem[j] for j in range(min(4, len(rem))) if j != g % len(rem)]
         seen = []
-        for l in order:
-            if l not in seen:
-                seen.append(l)
-        rows += [f"{g} {k} {c}" for k, c in seen]
+        for r in order:
+            if r not in seen:
+                seen.append(r)
+        rows += [f"{g} {r}" for r in seen]
     return "\n".join(rows) + "\n"
 
 
@@ -151,8 +214,8 @@ def owner_alive(plan):
     return hb.is_file() and time.time() - hb.stat().st_mtime < 300
 
 
-def write_plans(rem, viz=()):
-    txt = plan_text(rem, viz)
+def write_plans(rem, viz=(), score=()):
+    txt = plan_text(rem, viz, score)
     for p in DYN_PLANS:
         f = JF / f"plan_{p}.txt"
         if f.is_file() and f.read_text() == txt:
@@ -161,7 +224,7 @@ def write_plans(rem, viz=()):
         if not owner_alive(p):  # stale completion markers of an old plan content must not stop the chain
             for m in list(OUT.glob(f".chain_ok_plan_{p}_gpu*")) + [OUT / f".plan_done_plan_{p}"]:
                 m.unlink(missing_ok=True)
-        log(f"plan_{p} rewritten: {len(rem)} lanes")
+        log(f"plan_{p} rewritten: {txt.count(chr(10))} rows")
 
 
 def queue():
@@ -190,6 +253,7 @@ def submit(acct, part, tl, name, plan, chain):
 
 
 def publish(rem, excl, fails, q, final=False):
+    rem = list(rem)
     sh(["env", "OPENBLAS_NUM_THREADS=4", PY, "-I", str(JF / "convergence_check.py"), "--out-md", str(DST / "baselines/CONVERGENCE.md"),
         "--out-json", str(DST / "baselines/convergence.json")], timeout=1800)
     viz_index()
@@ -198,18 +262,20 @@ def publish(rem, excl, fails, q, final=False):
     sh(["bash", str(JF / "copy_figs.sh")])
     for clip in ("NFF-02", "NFF-08", "NFF-10"):
         sh([PY, "-I", str(JF / "montage.py"), "--clip", clip, "--frame", "0099", "--out", str(DST / "figures")])
-    st = "**COMPLETE.**" if final else f"**IN PROGRESS** — {len(rem)} SOTA lane(s) still running/queued; see `STATUS.md`."
+    st = "**COMPLETE.**" if final else f"**IN PROGRESS** — {len(rem)} work unit(s) still running/queued; see `STATUS.md`."
     sh([PY, "-I", str(JF / "final_table.py"), "--out", str(DST / "FINAL_TABLE.md"), "--status", st])
     mine = [r for r in (q or []) if r[2].startswith("finalbase")]
-    L = [f"# STATUS — SOTA baselines (auto-updated by supervisor.py, {time.strftime('%Y-%m-%d %H:%M')})", "",
-         "| method | clip | state |", "|---|---|---|"]
-    for k, c in LANES:
-        s = "DONE (RGB + LiDAR scored)" if done(k, c) else (
-            f"**EXCLUDED — failed {fails.get((k, c), 0)}x, needs attention** (log `{LOGS}/std/lanes/{k}__safe__{c}.log`)"
-            if (k, c) in excl else f"remaining ({fails.get((k, c), 0)} failure(s) so far)")
-        L.append(f"| {k} | {c} | {s} |")
+    L = [f"# STATUS — fair-budget comparison, every method {BUDGET} steps (auto-updated by supervisor.py, {time.strftime('%Y-%m-%d %H:%M')})", "",
+         "| work unit | state |", "|---|---|", "| SplatAD allfix + opreg5e4 x3 clips (30k) | DONE |"]
+    for l in all_lanes():
+        n = fails.get(l["key"], 0)
+        st = "DONE" if l["done"] else (f"**EXCLUDED — failed {n}x, needs attention**" if l["key"] in excl else
+                                       ("remaining" if l["ready"] else "waits for its training") + (f" ({n} failure(s))" if n else ""))
+        L.append(f"| {l['what']} | {st} |")
+    for lb, _ in [(x, None) for x in VIZ_ORDER]:
+        L.append(f"| 360-degree video {VIZ_CLIP} {lb} | {'DONE' if viz_done(lb) else 'queued (after its 30k training)'} |")
     L += ["", "Slurm jobs of this pipeline:", ""] + [f"- {r[0]} {r[1]} {r[2]} {r[3]}" for r in mine] + [
-        "", "SplatAD (allfix + opreg5e4) and the V1.3 lanes are complete. Results: `FINAL_TABLE.md` (compact),",
+        "", "Results: `FINAL_TABLE.md` (compact, with training time), `baselines/CONVERGENCE.md` (validation),",
         "`baselines/RESULTS_BASELINES.md` (full + wall time), figures `figures/` (GT vs methods, held-out frame 99) and",
         "`/users/yitiwang/FoggyfieldV1/RGB-LiDAR-Viz/baselines/<clip>/<method>/` (renders + LiDAR BEV).",
         f"Supervisor log: `{LOGS}/supervisor.log`; restart: `nohup setsid python3 -I {JF}/supervisor.py >> {LOGS}/supervisor.out 2>&1 &`."]
@@ -225,7 +291,7 @@ def viz_index():
          "fog-blobs in free space, or a scene that only looks right at frame 0 = overfitted / wrong geometry.",
          "Renderer: `/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/jobs/final/viz3d_orbit.py` (lane kind viz3d in node_final.sh).", "",
          "| method | video | frame-0 PSNR vs GT (0.5x) | median depth range over orbit (m) | checkpoint step |", "|---|---|---|---|---|"]
-    for lb in ["SplatAD", "NeuRAD", "UniSim", "EmerNeRF", "V1.3-Colour_UcnnR", "V1.3-BRDF_C7gR"]:
+    for lb in VIZ_ORDER:
         d = VIZ_DIR / VIZ_CLIP / lb
         try:
             m = json.loads((d / "meta.json").read_text())
@@ -234,7 +300,7 @@ def viz_index():
             L.append(f"| {lb} | {vids} | {m['frame0_psnr_vs_gt_db']:.2f} dB | {dr[0]:.1f}-{dr[1]:.1f} | {m['step']} |" if dr else
                      f"| {lb} | {vids} | {m['frame0_psnr_vs_gt_db']:.2f} dB | - | {m['step']} |")
         except Exception:
-            L.append(f"| {lb} | queued (rendered automatically in the next GPU chunk once the method has finished training) | | | |")
+            L.append(f"| {lb} | queued (rendered automatically once the method has finished its {BUDGET}-step training) | | | |")
     VIZ_DIR.mkdir(parents=True, exist_ok=True)
     (VIZ_DIR / "README.md").write_text("\n".join(L) + "\n")
 
@@ -253,15 +319,18 @@ def main():
     log(f"start pid {os.getpid()} (failures counted since {time.strftime('%F %T', time.localtime(s['since']))})")
     while time.time() < DEADLINE:
         fails = failures(s["since"])
-        excl = {l for l in LANES if not done(*l) and fails.get(l, 0) >= MAX_FAIL}
-        rem = [l for l in LANES if not done(*l) and l not in excl]
+        lanes = all_lanes()
+        excl = {l["key"] for l in lanes if not l["done"] and fails.get(l["key"], 0) >= MAX_FAIL}
+        act = [l for l in lanes if not l["done"] and l["key"] not in excl and l["ready"]]
+        rem = [l["row"] for l in act if not l.get("score")]
+        score = [l["row"] for l in act if l.get("score")]
         viz = [v for v in viz_lanes() if VIZ_FLAG.is_file() and not viz_done(v[0])
-               and fails.get(("viz3d:" + v[0], VIZ_CLIP), 0) < MAX_FAIL]
-        write_plans(rem, viz)
+               and fails.get(f"viz3d:{v[0]}:{VIZ_CLIP}", 0) < MAX_FAIL]
+        write_plans(rem, viz, score)
         q = queue()
         if q is not None:
             fb = [r for r in q if r[2].startswith("finalbase")]
-            if not rem and not viz:
+            if not rem and not viz and not score:
                 for r in fb:
                     if r[3] == "PENDING":
                         sh(["scancel", r[0]]); log(f"all lanes finished -> cancelled pending {r[0]} {r[2]}")
@@ -285,7 +354,7 @@ def main():
                         s["last_fallback"] = time.time(); s["fallback_acct"] = acct
         if time.time() - s["last_pub"] > PUBLISH_EVERY:
             publish(rem, excl, fails, q); s["last_pub"] = time.time()
-            log(f"published; remaining {rem}; excluded {sorted(excl)}")
+            log(f"published; remaining {rem + score}; viz {[v[0] for v in viz]}; excluded {sorted(excl)}")
         save_state(s)
         time.sleep(CYCLE)
     log("deadline"); PIDF.unlink(missing_ok=True)

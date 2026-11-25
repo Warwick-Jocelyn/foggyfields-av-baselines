@@ -49,34 +49,75 @@ def rows():
     r = []
     for c in CLIPS:
         for meth, tag, sub, it in (("splatad", "allfix", "splatad", 30000), ("splatad-opreg5e4", "opreg5e4", "splatad", 30000),
-                                   ("neurad", "std", "neurad", 30000), ("unisim", "std", "unisim", 20001), ("emernerf", "std", "emernerf", 25001)):
+                                   ("neurad", "std", "neurad", 30000), ("unisim", "std", "unisim", 30000), ("emernerf", "std", "emernerf", 30000)):
             rd = O / f"{tag}/{sub}/safe/{c}"
             r.append((meth, tag, c, rd, it, R / f"{tag}/metrics/metrics_{sub}__safe__{c}.json", rd / "renders/val"))
     for (lb, c), rd in sorted(v13_runs().items()):
         r.append((f"v13-{lb}", "v13", c, rd, 5000, R / f"v13/metrics/metrics_v13__{lb}__{c}.json", O / f"v13/{lb}__{c}/renders/val"))
+    OV = Path("/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight")
+    for c in CLIPS:   # fair-budget 30k lanes of our full models
+        for L in ("F", "Fc"):
+            lb = f"V13-{L}30k"
+            r.append((f"v13-{lb}", "v13", c, OV / f"20261123_{c}_v13_final30k/train/V13-{L}", 30000,
+                      R / f"v13/metrics/metrics_v13__{lb}__{c}.json", O / f"v13/{lb}__{c}/renders/val"))
     return r
 
 
-EM_RE = re.compile(r"\[(\d+)/(\d+)\].*?\bpsnr: ([-\d.eE+naninf]+) \(.*?total_pixel_loss: ([-\d.eE+naninf]+) ")
+EM_RE = re.compile(r"\[(\d+)/(\d+)\].*?\bpsnr: ([-\d.eE+naninf]+) \(.*?total_pixel_loss: ([-\d.eE+naninf]+) .*?\btime: ([\d.eE+-]+) ")
 
 
-def curves(meth, run, log):
-    """-> (steps, loss, psnr_steps, psnr) as numpy arrays"""
+def run_start(run):
+    """mtime of the marker written when the CURRENT configuration started from scratch (older segments are ignored)."""
+    ts = [p.stat().st_mtime for p in (run / "TRAIN_START", run / "TRAIN_SIG") if p.is_file()]
+    return min(ts) - 120 if ts else 0.0
+
+
+def curves(meth, run, log, iters):
+    """-> (steps, loss, psnr_steps, psnr, sec_per_step) of the current training only"""
     if meth == "emernerf":
         best = {}
         if log.is_file():
             for ln in log.read_text(errors="replace").splitlines():
                 m = EM_RE.search(ln)
-                if m:
-                    best[int(m.group(1))] = (float(m.group(4)), float(m.group(3)))
+                if m and abs(int(m.group(2)) - iters) <= 1:          # only the run with this schedule length
+                    best[int(m.group(1))] = (float(m.group(4)), float(m.group(3)), float(m.group(5)))
         st = np.array(sorted(best)); ls = np.array([best[s][0] for s in st]); ps = np.array([best[s][1] for s in st])
-        return st, ls, st, ps
-    ev = sorted(run.rglob("events.out.tfevents*"))
+        tm = np.array([best[s][2] for s in st])
+        return st, ls, st, ps, (float(np.median(tm)) if len(tm) else float("nan"))
+    t0 = run_start(run)
+    ev = sorted(p for p in run.rglob("events.out.tfevents*") if p.stat().st_mtime >= t0)
     if not ev:
-        return np.array([]), np.array([]), np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([]), np.array([]), float("nan")
     s = read_scalars(ev)
-    L = s.get("Train Loss", []); P = s.get("Train Metrics Dict/psnr", [])
-    return (np.array([x[0] for x in L]), np.array([x[2] for x in L]), np.array([x[0] for x in P]), np.array([x[2] for x in P]))
+    L = s.get("Train Loss", []); P = s.get("Train Metrics Dict/psnr", []); T = s.get("Train Iter (time)", [])
+    sps = float(np.median([x[2] for x in T])) if T else float("nan")
+    return (np.array([x[0] for x in L]), np.array([x[2] for x in L]), np.array([x[0] for x in P]), np.array([x[2] for x in P]), sps)
+
+
+def wall_hours(meth, tag, clip, run):
+    """logged wall-clock of the training stage of the current run (incl. start-up and restarts of resumed chunks)."""
+    import csv
+    t0 = run_start(run); tot = 0.0
+    if tag == "v13":
+        tl = run.parents[1] / "logs/timings.txt"
+        L = run.name.replace("V13-", "")
+        if tl.is_file():
+            for ln in tl.read_text().splitlines():
+                m = re.match(rf"V13-{re.escape(L)} train_to=\d+ from=\d+ rc=\d+ sec=(\d+)", ln)
+                if m:
+                    tot += float(m.group(1))
+        return tot / 3600 if tot else None
+    for f in (R / tag).glob("timings*.csv"):
+        with open(f) as fh:
+            for r in csv.DictReader(fh):
+                if r.get("method") == meth.split("-")[0] and r.get("clip") == clip and r.get("stage") == "train":
+                    try:
+                        ts = time.mktime(time.strptime(r["ts"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    except Exception:
+                        continue
+                    if ts >= t0:
+                        tot += float(r.get("seconds") or 0)
+    return tot / 3600 if tot else None
 
 
 def window(st, v, a, b, n):
@@ -112,8 +153,12 @@ def check(meth, tag, clip, run, iters, metp, rend):
     if met is None:
         return None
     log = BW / f"logs_final/{tag}/lanes/{meth.split('-')[0]}__safe__{clip}.log"
-    st, ls, pst, ps = curves(meth.split("-")[0] if meth.startswith("splatad") else meth, run, log)
-    res = {"method": meth, "variant": tag, "clip": clip, "iters": iters, "heldout_psnr": met.get("primary", {}).get("psnr")}
+    if int(met.get("iters") or iters) < iters - 1:      # e.g. the old 20k UniSim metrics: not this budget's result
+        return None
+    st, ls, pst, ps, sps = curves(meth.split("-")[0] if meth.startswith("splatad") else meth, run, log, iters)
+    res = {"method": meth, "variant": tag, "clip": clip, "iters": iters, "heldout_psnr": met.get("primary", {}).get("psnr"),
+           "sec_per_step": sps, "train_compute_h": (sps * iters / 3600) if math.isfinite(sps) else None,
+           "train_wall_h": wall_hours(meth, tag, clip, run)}
     checks = {}
     if len(st):
         n = iters
@@ -154,8 +199,8 @@ def main():
     L = [f"# Convergence / sanity validation of every scored row ({time.strftime('%Y-%m-%d %H:%M')}, jobs/final/convergence_check.py)", "",
          "C1 finished (≥98 % of schedule) · C2 finite loss · C3 plateau (median loss last 10 % vs 70–80 % window drops ≤15 %, and below the first 10 %) · "
          "C4 train−held-out PSNR gap in [−1, +8] dB · C5 not grey/blurred (held-out render/GT contrast ratio ≥0.70 and detail ratio ≥0.50, 21 images).", "",
-         "| method | clip | verdict | last step | loss first10 → 70-80 → last10 (rel. drop) | train PSNR | held-out PSNR | gap dB | contrast | detail |",
-         "|---|---|---|---|---|---|---|---|---|---|"]
+         "| method | clip | verdict | last step | loss first10 → 70-80 → last10 (rel. drop) | train PSNR | held-out PSNR | gap dB | contrast | detail | s/step | train compute h | train wall h |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in out:
         c = r["checks"]; c3 = c.get("C3_plateau", {}); c4 = c.get("C4_gap", {}); c5 = c.get("C5_not_grey", {})
         bad = [k for k, v in c.items() if v.get("ok") is False]
@@ -163,7 +208,8 @@ def main():
         L.append(f"| {r['method']} | {r['clip']} | {v} | {f(c.get('C1_finished', {}).get('last_step'))} | "
                  f"{f(c3.get('loss_first10'), 4)} → {f(c3.get('loss_70_80'), 4)} → {f(c3.get('loss_last10'), 4)} ({f(c3.get('rel_drop_last'), 2)}) | "
                  f"{f(c4.get('train_psnr_last10'), 2)} | {f(r['heldout_psnr'], 2)} | {f(c4.get('gap_db'), 2)} | "
-                 f"{f(c5.get('contrast_ratio'), 2)} | {f(c5.get('detail_ratio'), 2)} |")
+                 f"{f(c5.get('contrast_ratio'), 2)} | {f(c5.get('detail_ratio'), 2)} | {f(r.get('sec_per_step'), 3)} | "
+                 f"{f(r.get('train_compute_h'), 2)} | {f(r.get('train_wall_h'), 2)} |")
     a.out_md.write_text("\n".join(L) + "\n")
     print("\n".join(L))
 

@@ -71,7 +71,7 @@ def main():
             m, l = load(mp), load(lp)
             if m or l:
                 rows.append(row(name, m, l, (m or {}).get("iters") or 30000, *timings(R / tag, "splatad", clip), mp, lp))
-        for meth, name, it in (("neurad", "NeuRAD standard (30k, corrected bench)", 30000), ("emernerf", "EmerNeRF (25k, corrected bench)", 25000), ("unisim", "UniSim (20k, corrected bench, no ray drop)", 20001)):
+        for meth, name, it in (("neurad", "NeuRAD standard (30k, corrected bench)", 30000), ("emernerf", "EmerNeRF (corrected bench, 30k)", 30000), ("unisim", "UniSim (corrected bench, no ray drop, 30k schedule)", 30000)):
             mp, lp = R / "std" / "metrics" / f"metrics_{meth}__safe__{clip}.json", R / "std" / "lidar" / f"lidar_{meth}_safe__{clip}.json"
             m, l = load(mp), load(lp)
             if m or l:

@@ -44,17 +44,22 @@ def v13key(*labels):
     return f
 
 
-ROWS = [  # (name, group, iters, path fn, convergence key fn)
+BUDGET = 30000
+ROWS = [  # (name, group, iters, path fn, convergence key fn) -- the FAIR comparison: every row trained BUDGET steps
     ("SplatAD (allfix: opacity reg 5e-4 + F1b/F2b)", "SOTA", "30k", ext("allfix", "splatad"), lambda c: "splatad"),
     ("SplatAD (opreg5e4, pre-fix data path)", "SOTA", "30k", ext("opreg5e4", "splatad"), lambda c: "splatad-opreg5e4"),
     ("NeuRAD (standard, corrected bench)", "SOTA", "30k", ext("std", "neurad"), lambda c: "neurad"),
-    ("UniSim (corrected bench, no ray drop)", "SOTA", "20k", ext("std", "unisim"), lambda c: "unisim"),
-    ("EmerNeRF (corrected bench)", "SOTA", "25k", ext("std", "emernerf"), lambda c: "emernerf"),
+    ("UniSim (corrected bench, no ray drop; schedule x1.5)", "SOTA", "30k", ext("std", "unisim"), lambda c: "unisim"),
+    ("EmerNeRF (corrected bench)", "SOTA", "30k", ext("std", "emernerf"), lambda c: "emernerf"),
+    ("FoggyField V1.3 BRDF + LiDAR (F)", "ours", "30k", v13("V13-F30k"), v13key("V13-F30k")),
+    ("FoggyField V1.3 Colour + LiDAR (Fc)", "ours", "30k", v13("V13-Fc30k"), v13key("V13-Fc30k")),
+]
+ROWS_5K = [  # earlier 5k-step lanes: NOT budget-matched, appendix only
     ("NeuRAD A0 (V1.3 suite, 5k)", "ours-suite", "5k", v13("A0"), v13key("A0")),
-    ("FoggyField V1.3 BRDF (U0 / C7gR)", "ours", "5k", v13("V13-U0", "V13-C7gR"), v13key("V13-U0", "V13-C7gR")),
-    ("FoggyField V1.3 Colour (UcnnR)", "ours", "5k", v13("V13-UcnnR"), v13key("V13-UcnnR")),
-    ("FoggyField V1.3 BRDF + LiDAR (F)", "ours", "5k", v13("V13-F"), v13key("V13-F")),
-    ("FoggyField V1.3 Colour + LiDAR (Fc)", "ours", "5k", v13("V13-Fc"), v13key("V13-Fc")),
+    ("FoggyField V1.3 BRDF (U0 / C7gR, 5k)", "ours", "5k", v13("V13-U0", "V13-C7gR"), v13key("V13-U0", "V13-C7gR")),
+    ("FoggyField V1.3 Colour (UcnnR, 5k)", "ours", "5k", v13("V13-UcnnR"), v13key("V13-UcnnR")),
+    ("FoggyField V1.3 BRDF + LiDAR (F, 5k)", "ours", "5k", v13("V13-F"), v13key("V13-F")),
+    ("FoggyField V1.3 Colour + LiDAR (Fc, 5k)", "ours", "5k", v13("V13-Fc"), v13key("V13-Fc")),
 ]
 CONV = Path("/users/yitiwang/FoggyfieldV1/RGB-Branch-Metrics/baselines/convergence.json")
 
@@ -71,8 +76,10 @@ METRICS = [  # (label, kind, key, higher_better, digits)
 ]
 
 
-def value(fn, c, kind, key):
+def value(fn, c, kind, key, min_iters=0):
     mp, lp = fn(c)
+    if min_iters and int((load(mp) or {}).get("iters") or 0) < min_iters - 1:
+        return None          # e.g. the superseded 20k UniSim / 25k EmerNeRF results
     if kind == "rgb":
         d = load(mp)
         return None if d is None else d.get("primary", {}).get(key)
@@ -93,42 +100,70 @@ def main():
            "range along the GT ray): CD = symmetric mean NN distance, CD² = squared variant / |G|, depth median = median |r_pred−r_gt|. "
            "No method's ray-drop head is used (oracle drop) so every row is scored on the same rays. Details + per-run wall time: "
            "`baselines/RESULTS_BASELINES.md`.", "",
-           "**Budget caveat:** SOTA rows use their standard schedules (20–30k steps); V1.3 rows are 5k-step lanes. "
-           "Bold = best in the column (all rows).", "",
+           "**Fair budget:** every row of the main tables trained exactly 30 000 steps (each method's LR schedule stretched to 30k "
+           "where its default was shorter: UniSim 20k -> 30k incl. its stage schedule, EmerNeRF 25k -> 30k, V1.3 5k -> 30k with its 4 stages x6). "
+           "Same split (nvs_50_50), same 693 held-out images and 99 held-out LiDAR sweeps, same evaluator for every row. "
+           "Bold = best in the column.", "",
            "**Validation marks** (`baselines/CONVERGENCE.md`: finished, finite loss, loss plateau, train/held-out gap, renders not grey): "
            "plain number = PASS; `⚠` = a check FAILED (do not cite without reading CONVERGENCE.md); `†` = not fully validated yet.", ""]
     V = verdicts()
-    for label, kind, key, hb, nd in METRICS:
-        vals = {(r[0], c): value(r[3], c, kind, key) for r in ROWS for c in CLIPS}
-        best = {}
-        for c in CLIPS + ["mean"]:
-            col = []
-            for r in ROWS:
-                v = vals[(r[0], c)] if c != "mean" else (
-                    sum(vals[(r[0], k)] for k in CLIPS) / 3 if all(vals[(r[0], k)] is not None for k in CLIPS) else None)
-                if v is not None:
-                    col.append(v)
-            best[c] = (max(col) if hb else min(col)) if col else None
-        out += [f"## {label}", "", "| method | group | steps | " + " | ".join(CLIPS) + " | mean (3 clips) |",
-                "|---|---|---|" + "---|" * (len(CLIPS) + 1)]
-        for r in ROWS:
-            cells = []
-            vs = [vals[(r[0], c)] for c in CLIPS]
-            mean = sum(vs) / 3 if all(v is not None for v in vs) else None
-            for c, v in list(zip(CLIPS, vs)) + [("mean", mean)]:
-                if v is None:
-                    cells.append("n/a")
-                else:
-                    s = f"{v:.{nd}f}"
-                    s = f"**{s}**" if best[c] is not None and abs(v - best[c]) < 1e-12 else s
-                    if c != "mean":
-                        vd = V.get((r[4](c), c))
-                        s += "" if vd == "PASS" else (" ⚠" if vd == "FAIL" else " †")
-                    cells.append(s)
-            if all(x == "n/a" for x in cells):
-                cells = ["n/a"] * len(cells)
-            out.append(f"| {r[0]} | {r[1]} | {r[2]} | " + " | ".join(cells) + " |")
-        out.append("")
+    def tables(rows, min_iters, title):
+        res = [title, ""]
+        for label, kind, key, hb, nd in METRICS:
+            vals = {(r[0], c): value(r[3], c, kind, key, min_iters) for r in rows for c in CLIPS}
+            best = {}
+            for c in CLIPS + ["mean"]:
+                col = []
+                for r in rows:
+                    v = vals[(r[0], c)] if c != "mean" else (
+                        sum(vals[(r[0], k)] for k in CLIPS) / 3 if all(vals[(r[0], k)] is not None for k in CLIPS) else None)
+                    if v is not None:
+                        col.append(v)
+                best[c] = (max(col) if hb else min(col)) if col else None
+            res += [f"### {label}", "", "| method | group | steps | " + " | ".join(CLIPS) + " | mean (3 clips) |",
+                    "|---|---|---|" + "---|" * (len(CLIPS) + 1)]
+            for r in rows:
+                cells = []
+                vs = [vals[(r[0], c)] for c in CLIPS]
+                mean = sum(vs) / 3 if all(v is not None for v in vs) else None
+                for c, v in list(zip(CLIPS, vs)) + [("mean", mean)]:
+                    if v is None:
+                        cells.append("n/a")
+                    else:
+                        s_ = f"{v:.{nd}f}"
+                        s_ = f"**{s_}**" if best[c] is not None and abs(v - best[c]) < 1e-12 else s_
+                        if c != "mean":
+                            vd = V.get((r[4](c), c))
+                            s_ += "" if vd == "PASS" else (" ⚠" if vd == "FAIL" else " †")
+                        cells.append(s_)
+                res.append(f"| {r[0]} | {r[1]} | {r[2]} | " + " | ".join(cells) + " |")
+            res.append("")
+        return res
+
+    out += tables(ROWS, BUDGET, f"## Fair comparison — every method trained {BUDGET} steps, same held-out set")
+    # training cost from convergence.json (pure optimisation time = sum of per-step times; wall = incl. start-up / restarts)
+    try:
+        C = {(r["method"], r["clip"]): r for r in json.loads(CONV.read_text())}
+    except Exception:
+        C = {}
+    out += ["## Training cost (one GH200 GPU per run; same 30k steps)", "",
+            "Cell = optimisation time h (logged wall-clock h incl. start-up and chunk restarts) · s/step. Steps are NOT equal work: "
+            "SplatAD = 1 camera image per step; NeuRAD / UniSim = ray batches (camera + LiDAR rays); EmerNeRF = ray batch; "
+            "V1.3 = NeuRAD ray batch + physics terms.", "",
+            "| method | " + " | ".join(CLIPS) + " | total optimisation h (3 clips) |", "|---|" + "---|" * (len(CLIPS) + 1)]
+    for r in ROWS:
+        cells, tot = [], 0.0
+        for c in CLIPS:
+            d = C.get((r[4](c), c))
+            if d and d.get("train_compute_h") is not None:
+                w = d.get("train_wall_h")
+                cells.append(f"{d['train_compute_h']:.2f} h ({w:.2f} h) · {d['sec_per_step']:.3f} s" if w else f"{d['train_compute_h']:.2f} h · {d['sec_per_step']:.3f} s")
+                tot += d["train_compute_h"]
+            else:
+                cells.append("n/a")
+        out.append(f"| {r[0]} | " + " | ".join(cells) + f" | {tot:.2f} h |" if tot else f"| {r[0]} | " + " | ".join(cells) + " | n/a |")
+    out.append("")
+    out += tables(ROWS_5K, 0, "## Appendix — earlier V1.3 lanes at 5k steps (NOT budget-matched; for reference only)")
     a.out.write_text("\n".join(out) + "\n")
     print(f"wrote {a.out}")
 

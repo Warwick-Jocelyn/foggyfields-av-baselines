@@ -74,7 +74,7 @@ one(){  # gpu kind args...
       # venv-emernerf self-repair (purge damage), serialised across the lanes of this node
       run_bg flock "$BW/venv-emernerf/.fix.lock" bash "$BW/jobs/final/emer_fix_env.sh" >> "$lg" 2>&1; rc=$?
       [ $rc -eq 0 ] || { say "emernerf env repair failed rc=$rc (see $lg)"; return $rc; }
-      run_bg bash "$BW/jobs/emernerf/lane_emernerf.sh" "$c" "$g" >> "$lg" 2>&1; rc=$? ;;
+      run_bg env ITERS="${EMER_ITERS:-30000}" bash "$BW/jobs/emernerf/lane_emernerf.sh" "$c" "$g" >> "$lg" 2>&1; rc=$? ;;
     v13)   # c = label, $1 = clip, $2 = config
       mkdir -p "$BW/logs_final/v13"
       run_bg bash "$BW/jobs/final/v13_lane.sh" "$c" "$1" "$2" "$g" >> "$BW/logs_final/v13/${c}__$1.log" 2>&1; rc=$? ;;
@@ -90,6 +90,13 @@ one(){  # gpu kind args...
         sleep 60
       done
       wait $PP 2>/dev/null; rc=0 ;;
+    v13train)  # c = clip, $1 = lane (F | Fc): FoggyField V1.3 at the fair 30k budget, training only (jobs/final/v13train.sh)
+      mkdir -p "$BW/logs_final/v13"; local tl=$BW/logs_final/v13/train30k_V13-${1}__$c.log
+      local td=/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261123_${c}_v13_final30k/train/V13-$1/TRAIN_DONE
+      { echo; echo "######## $(date -Is) job $SLURM_JOB_ID gpu $g v13train $1 $c (30k) ########"; } >> "$tl"
+      run_bg env TOKENS="$c:$1" GPU0=$g RUN_SUFFIX=30k STEPS=30000 METHOD=neurad-fog-v13-30k B_END=15000 C_END=21000 SAVE_EVERY=1000 \
+        SKIP_POST=1 V13=/capstor/scratch/cscs/yitiwang/splatad-nff-repro/code/neurad-studio-v13-final-run2 bash "$BW/jobs/final/v13train.sh" >> "$tl" 2>&1; rc=$?
+      [ $rc -eq 0 ] && [ ! -f "$td" ] && rc=75 ;;   # skipped (lane owned by another live job) -> busy, not done
     viz3d)  # c = clip, $1 = label, $2 = config.yml : 360-deg orbit video (jobs/final/viz3d_orbit.py) -> RGB_branch_3D_viz
       local lb=$1 cfg=$2 vd=/users/yitiwang/FoggyfieldV1/RGB_branch_3D_viz/$c/$1
       mkdir -p "$BW/logs_final/viz3d" "$vd"; local vl=$BW/logs_final/viz3d/${lb}__$c.log
