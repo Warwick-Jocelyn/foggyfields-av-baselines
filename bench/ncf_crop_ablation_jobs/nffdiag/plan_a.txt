@@ -1,0 +1,4 @@
+0 base NFF-13
+1 los0 NFF-13
+2 camonly NFF-13
+3 opreg0 NFF-13

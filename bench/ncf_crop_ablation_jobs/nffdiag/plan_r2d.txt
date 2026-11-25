@@ -1,0 +1,5 @@
+0 base NCF-02
+0 opreg0 NCF-02
+1 opreg5e4 NCF-02
+2 allfix NCF-02
+3 allfix NFF-15

@@ -1,0 +1,4 @@
+0 v13 V13-C7gR NFF-02 /capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261119_2030_NFF-02_v13_mat/train/V13-C7gR/V13-C7gR/neurad-fog-v13-5k/run/config.yml
+1 splatad NFF-08
+2 emernerf NFF-08
+3 neurad NFF-08

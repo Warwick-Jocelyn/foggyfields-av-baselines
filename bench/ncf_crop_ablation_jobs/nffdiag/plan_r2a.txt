@@ -1,0 +1,4 @@
+0 opreg0 NFF-13
+1 opreg0 NFF-15
+2 opreg0 NFF-05
+3 opreg5e4 NFF-13

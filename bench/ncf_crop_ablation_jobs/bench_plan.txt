@@ -1,0 +1,19 @@
+# Static lane plan for jobs/debug_chunk.sbatch:  <node> <gpu> <method> <clip>
+# One lane per GPU, safe_crop only, nvs_50_50. Every chunk runs the SAME plan: finished stages are
+# skipped, interrupted trainings resume from their newest checkpoint.
+# NeuRAD (~170 ms/it x 30k) is the longest lane, so it gets a node of its own plus one slot.
+0 0 neurad   NCF-02
+0 1 neurad   NCF-07
+0 2 neurad   NCF-10
+0 3 neurad   NCF-15
+1 0 neurad   NFF-05
+1 1 unisim   NCF-02
+1 2 unisim   NCF-07
+1 3 unisim   NCF-10
+2 0 unisim   NCF-15
+2 1 unisim   NFF-05
+2 2 emernerf NCF-02
+2 3 emernerf NCF-07
+3 0 emernerf NCF-10
+3 1 emernerf NCF-15
+3 2 emernerf NFF-05

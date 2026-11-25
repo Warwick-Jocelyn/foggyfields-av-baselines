@@ -1,0 +1,4 @@
+0 base NFF-15
+1 los0 NFF-15
+2 camonly NFF-15
+3 noise NFF-15

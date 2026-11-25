@@ -1,0 +1,4 @@
+0 base NCF-10
+1 posefix NCF-10
+2 boxfix NCF-10
+3 boxpose NCF-10

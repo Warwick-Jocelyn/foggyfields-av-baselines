@@ -1,0 +1,2 @@
+V13-C7gR NFF-02 /capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261119_2030_NFF-02_v13_mat/train/V13-C7gR/V13-C7gR/neurad-fog-v13-5k/run/config.yml
+A0 NFF-02 /capstor/scratch/cscs/yitiwang/foggyfields-v1/runs/v12_smoke_nff02_3964587/A0/A0/neurad/2026-11-17_173034/config.yml
