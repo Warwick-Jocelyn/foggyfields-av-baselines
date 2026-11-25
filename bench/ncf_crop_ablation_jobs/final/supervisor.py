@@ -234,7 +234,7 @@ def viz_index():
             L.append(f"| {lb} | {vids} | {m['frame0_psnr_vs_gt_db']:.2f} dB | {dr[0]:.1f}-{dr[1]:.1f} | {m['step']} |" if dr else
                      f"| {lb} | {vids} | {m['frame0_psnr_vs_gt_db']:.2f} dB | - | {m['step']} |")
         except Exception:
-            L.append(f"| {lb} | pending (renders once the method is trained{'; EmerNeRF renderer still to be written' if lb == 'EmerNeRF' else ''}) | | | |")
+            L.append(f"| {lb} | queued (rendered automatically in the next GPU chunk once the method has finished training) | | | |")
     VIZ_DIR.mkdir(parents=True, exist_ok=True)
     (VIZ_DIR / "README.md").write_text("\n".join(L) + "\n")
 
@@ -267,6 +267,10 @@ def main():
                         sh(["scancel", r[0]]); log(f"all lanes finished -> cancelled pending {r[0]} {r[2]}")
                 if not any(r[3] == "RUNNING" for r in fb):
                     publish(rem, excl, fails, queue(), final=True)
+                    rc, out = sh(["bash", str(JF / "publish_github.sh"), "final"], timeout=1200)
+                    log(f"GitHub final publish rc={rc}: {out.strip()[-400:]}")
+                    with open(PLANMD, "a") as fh:
+                        fh.write(f"- {time.strftime('%m-%d %H:%M')} supervisor: ALL DONE; GitHub final publish rc={rc}; excluded {sorted(excl)}.\n")
                     log(f"ALL DONE (excluded: {sorted(excl)})"); PIDF.unlink(missing_ok=True); return
             else:
                 dbg_mine = [r for r in q if r[1] == "debug"]
