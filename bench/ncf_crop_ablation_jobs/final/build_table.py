@@ -59,7 +59,7 @@ HEAD = ("| row | iters | GPU wall (train / render+eval) | PSNR ↑ | SSIM ↑ | 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, default=Path("/capstor/scratch/cscs/yitiwang/ncf-crop-ablation"))
-    ap.add_argument("--clips", nargs="+", default=["NFF-02", "NFF-08", "NFF-10"])
+    ap.add_argument("--clips", nargs="+", default=["NFF-02", "NFF-08", "NFF-10", "NFF-05"])
     ap.add_argument("--write", type=Path, default=None)
     a = ap.parse_args()
     R = a.root / "results_final"

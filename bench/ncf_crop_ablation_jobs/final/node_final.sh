@@ -47,7 +47,7 @@ one(){  # gpu kind args...
       local lg=$LOG_ROOT/lanes/splatad__safe__$c.log
       { echo; echo "######## $(date -Is) job $SLURM_JOB_ID gpu $g splatad/$v $c extra: $SPLATAD_EXTRA dp: $SPLATAD_DP_EXTRA code: $NS_REPO ########"; } >> "$lg"
       run_bg bash "$BW/jobs/lane.sh" splatad safe "$c" "$g" >> "$lg" 2>&1; rc=$?
-      [ $rc -eq 0 ] && { export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS=""
+      [ $rc -eq 0 ] && { export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS="$c"
         run_bg bash "$BW/jobs/lidar_lane.sh" splatad "$c" "$g" >> "$LOG_ROOT/lanes/lidar_splatad__safe__$c.log" 2>&1; rc=$?; }
       ;;
     neurad)
@@ -55,7 +55,7 @@ one(){  # gpu kind args...
       local lg=$LOG_ROOT/lanes/neurad__safe__$c.log
       { echo; echo "######## $(date -Is) job $SLURM_JOB_ID gpu $g neurad $c extra: $NEURAD_EXTRA dp: $NEURAD_DP_EXTRA code: $NS_REPO ########"; } >> "$lg"
       run_bg bash "$BW/jobs/lane.sh" neurad safe "$c" "$g" >> "$lg" 2>&1; rc=$?
-      [ $rc -eq 0 ] && { export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS=""
+      [ $rc -eq 0 ] && { export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS="$c"
         run_bg bash "$BW/jobs/lidar_lane.sh" neurad "$c" "$g" >> "$LOG_ROOT/lanes/lidar_neurad__safe__$c.log" 2>&1; rc=$?; }
       ;;
     unisim)
@@ -65,7 +65,7 @@ one(){  # gpu kind args...
       run_bg flock "$BW/.unisim_install.lock" bash "$BW/jobs/final/unisim_install.sh" >> "$lg" 2>&1; rc=$?
       [ $rc -eq 0 ] || { say "unisim plugin install failed rc=$rc"; return $rc; }
       run_bg bash "$BW/jobs/lane.sh" unisim safe "$c" "$g" >> "$lg" 2>&1; rc=$?
-      [ $rc -eq 0 ] && { export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS=""
+      [ $rc -eq 0 ] && { export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS="$c"
         run_bg bash "$BW/jobs/lidar_lane.sh" unisim "$c" "$g" >> "$LOG_ROOT/lanes/lidar_unisim__safe__$c.log" 2>&1; rc=$?; } ;;
     emernerf)
       mkdir -p "$LOG_ROOT/lanes" "$RES_ROOT"; export TIMINGS=$RES_ROOT/timings_emernerf.csv
@@ -90,6 +90,15 @@ one(){  # gpu kind args...
         sleep 60
       done
       wait $PP 2>/dev/null; rc=0 ;;
+    lidardump)  # c = clip, $1 = method (splatad|neurad|unisim), $2 = variant dir (allfix|std): re-run the LiDAR eval WITH the per-sweep
+      # dump (same numbers + dump) for runs scored before dumps were kept (2026-11-25: extended LiDAR metrics)
+      local m=$1 v=$2
+      export OUT_ROOT=$R0/$v RES_ROOT=$S0/$v VIZ_ROOT=$Z0/$v LOG_ROOT=$L0/$v; mkdir -p "$LOG_ROOT/lanes"
+      if [ -d "$OUT_ROOT/_lidar_dump/${m}_safe__$c" ]; then say "lidardump $m $c already dumped"; rc=0
+      else
+        export BENCH_OUT=$OUT_ROOT BENCH_RES=$RES_ROOT BENCH_LOG=$LOG_ROOT BENCH_DATA=$DATA_ROOT DUMP_CLIPS="$c"
+        run_bg env FORCE_LIDAR=1 bash "$BW/jobs/lidar_lane.sh" "$m" "$c" "$g" >> "$LOG_ROOT/lanes/lidar_${m}__safe__$c.log" 2>&1; rc=$?
+      fi ;;
     v13train)  # c = clip, $1 = lane (F | Fc): FoggyField V1.3 at the fair 30k budget, training only (jobs/final/v13train.sh)
       mkdir -p "$BW/logs_final/v13"; local tl=$BW/logs_final/v13/train30k_V13-${1}__$c.log
       local td=/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight/20261123_${c}_v13_final30k/train/V13-$1/TRAIN_DONE

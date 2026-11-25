@@ -1,58 +1,54 @@
 0 viz3d NFF-02 SplatAD /capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_final/allfix/splatad/safe/NFF-02/splatad_safe_NFF-02/splatad/2026-11-24_043308/config.yml
+0 lidardump NFF-02 splatad allfix
 0 emernerf NFF-02
-0 v13train NFF-02 Fc
-0 v13train NFF-08 F
-0 v13train NFF-08 Fc
-0 v13train NFF-10 F
-0 v13train NFF-10 Fc
-0 unisim NFF-02
 0 unisim NFF-08
 0 unisim NFF-10
 0 neurad NFF-08
 0 neurad NFF-10
+0 emernerf NFF-05
+0 splatad NFF-05
+0 unisim NFF-05
+0 neurad NFF-05
 0 emernerf NFF-08
 0 emernerf NFF-10
-0 v13train NFF-02 F
+0 unisim NFF-02
 1 viz3d NFF-02 NeuRAD /capstor/scratch/cscs/yitiwang/ncf-crop-ablation/outputs_final/std/neurad/safe/NFF-02/neurad_safe_NFF-02/neurad/2026-11-25_010653/config.yml
+1 lidardump NFF-08 splatad allfix
 1 emernerf NFF-08
-1 v13train NFF-02 Fc
-1 v13train NFF-08 F
-1 v13train NFF-08 Fc
-1 v13train NFF-10 F
-1 v13train NFF-10 Fc
-1 unisim NFF-02
 1 unisim NFF-08
 1 unisim NFF-10
 1 neurad NFF-08
 1 neurad NFF-10
+1 emernerf NFF-05
+1 splatad NFF-05
+1 unisim NFF-05
+1 neurad NFF-05
 1 emernerf NFF-02
 1 emernerf NFF-10
-1 v13train NFF-02 F
+1 unisim NFF-02
+2 lidardump NFF-10 splatad allfix
 2 emernerf NFF-10
-2 v13train NFF-02 Fc
-2 v13train NFF-08 F
-2 v13train NFF-08 Fc
-2 v13train NFF-10 F
-2 v13train NFF-10 Fc
-2 unisim NFF-02
 2 unisim NFF-08
 2 unisim NFF-10
 2 neurad NFF-08
 2 neurad NFF-10
+2 emernerf NFF-05
+2 splatad NFF-05
+2 unisim NFF-05
+2 neurad NFF-05
 2 emernerf NFF-02
 2 emernerf NFF-08
-2 v13train NFF-02 F
-3 v13train NFF-02 F
-3 v13train NFF-02 Fc
-3 v13train NFF-08 F
-3 v13train NFF-08 Fc
-3 v13train NFF-10 F
-3 v13train NFF-10 Fc
+2 unisim NFF-02
+3 lidardump NFF-02 neurad std
 3 unisim NFF-02
 3 unisim NFF-08
 3 unisim NFF-10
 3 neurad NFF-08
 3 neurad NFF-10
+3 emernerf NFF-05
+3 splatad NFF-05
+3 unisim NFF-05
+3 neurad NFF-05
 3 emernerf NFF-02
 3 emernerf NFF-08
 3 emernerf NFF-10

@@ -34,7 +34,9 @@ DEADLINE = time.time() + 4 * 86400
 CLIPS = ["NFF-02", "NFF-08", "NFF-10"]
 BUDGET = 30000          # 2026-11-25 user: every method trains the SAME number of steps (fair budget) -> 30k for all
 OV = Path("/capstor/scratch/cscs/yitiwang/foggyfields-v1/v13_overnight")
-V13_LANES = {"F": "V1.3-BRDF+LiDAR_F", "Fc": "V1.3-Colour+LiDAR_Fc"}   # our full models at 30k (ablation parked)
+# 2026-11-25 18:15 user: "forget the BRDF variants for now, baseline performance only" -> no V1.3 training/scoring/viz lanes.
+# The 30k V1.3 recipe (neurad-fog-v13-30k, jobs/final/v13train.sh) is kept; re-enable with the two lanes below.
+V13_LANES = {}   # was {"F": "V1.3-BRDF+LiDAR_F", "Fc": "V1.3-Colour+LiDAR_Fc"}
 DYN_PLANS = ["A", "B", "C", "D2", "D3", "N1", "N2", "N3", "N4", "N5", "P"]
 # 3D 360-deg orbit videos (jobs/final/viz3d_orbit.py, lane kind viz3d) on one clip, enabled by the flag file after the smoke test
 VIZ_CLIP = "NFF-02"
@@ -50,9 +52,9 @@ def _json(p):
         return None
 
 
-def sota_done(k, c):
+def sota_done(k, c, v="std"):
     """RGB metrics at the 30k budget AND a LiDAR JSON written after them."""
-    mp, lp = RES / "std/metrics" / f"metrics_{k}__safe__{c}.json", RES / "std/lidar" / f"lidar_{k}_safe__{c}.json"
+    mp, lp = RES / v / "metrics" / f"metrics_{k}__safe__{c}.json", RES / v / "lidar" / f"lidar_{k}_safe__{c}.json"
     m = _json(mp)
     return bool(m) and int(m.get("iters") or 0) >= BUDGET and lp.is_file() and lp.stat().st_mtime >= mp.stat().st_mtime - 60
 
@@ -88,6 +90,12 @@ def all_lanes():
         L.append(dict(key=f"unisim:{c}", row=f"unisim {c}", done=sota_done("unisim", c), ready=True, what=f"UniSim {c} (30k)"))
     for c in ("NFF-08", "NFF-10", "NFF-02"):
         L.append(dict(key=f"neurad:{c}", row=f"neurad {c}", done=sota_done("neurad", c), ready=True, what=f"NeuRAD {c} (30k)"))
+    # 2026-11-25 user: add NFF-05 (night / dark weather) for the SOTA comparison (V1.3 on NFF-05 needs its per-clip inputs first)
+    for k, v, nm in (("emernerf", "std", "EmerNeRF"), ("splatad", "allfix", "SplatAD allfix"), ("unisim", "std", "UniSim"), ("neurad", "std", "NeuRAD")):
+        L.append(dict(key=f"{k}:NFF-05", row=f"{k} NFF-05", done=sota_done(k, "NFF-05", v), ready=True, what=f"{nm} NFF-05 night (30k)"))
+    for m, v, c in [("splatad", "allfix", c) for c in CLIPS] + [("neurad", "std", "NFF-02")]:   # scored before dumps were kept
+        L.append(dict(key=f"lidardump:{m}:{c}", row=f"lidardump {c} {m} {v}", done=(OUT / v / "_lidar_dump" / f"{m}_safe__{c}").is_dir(),
+                      ready=True, score=True, what=f"{m} {c} LiDAR re-dump (extended metrics)"))
     for c in CLIPS:
         for l in V13_LANES:
             cfg = v13_cfg(c, l)
@@ -180,7 +188,8 @@ def failures(since):
                 if int(rc) in (0, 75, 143):
                     continue
                 r1 = rest.split()[0] if rest.split() else ""
-                key = {"viz3d": f"viz3d:{r1}:{a1}", "v13train": f"v13train:{r1}:{a1}", "v13": f"v13:{a1}:{r1}"}.get(k, f"{k}:{a1}")
+                key = {"viz3d": f"viz3d:{r1}:{a1}", "v13train": f"v13train:{r1}:{a1}", "v13": f"v13:{a1}:{r1}",
+                       "lidardump": f"lidardump:{r1}:{a1}"}.get(k, f"{k}:{a1}")
                 add(ts, [key]); continue
             m = ENV_RE.match(ln)
             if m:
@@ -252,8 +261,30 @@ def submit(acct, part, tl, name, plan, chain):
     return None
 
 
+def lidar_ext():
+    """extended LiDAR metrics (jobs/final/lidar_extended.py, CPU) for every per-sweep dump without an up-to-date result."""
+    jobs = []
+    for v in ("allfix", "opreg5e4", "std"):
+        for d in (OUT / v / "_lidar_dump").glob("*_safe__NFF-*"):
+            m, c = d.name.split("_safe__")
+            jobs.append((d, RES / v / "lidar_ext" / f"lidar_ext__{m}__{c}.json", m, c))
+    for d in (OUT / "std/emernerf/safe").glob("NFF-*/lidar_dump"):
+        jobs.append((d, RES / "std/lidar_ext" / f"lidar_ext__emernerf__{d.parent.name}.json", "emernerf", d.parent.name))
+    for d in (OUT / "v13").glob("*__NFF-*/lidar_dump"):
+        lb, c = d.parent.name.split("__")
+        jobs.append((d, RES / "v13/lidar_ext" / f"lidar_ext__{lb}__{c}.json", lb, c))
+    for d, o, lb, c in jobs:
+        fs = list(d.glob("frame_*.npz"))
+        if len(fs) < 99 or (o.is_file() and o.stat().st_mtime >= max(f.stat().st_mtime for f in fs)):
+            continue
+        rc, out = sh(["env", "OPENBLAS_NUM_THREADS=4", PY, "-I", str(JF / "lidar_extended.py"), "--dump", str(d), "--out", str(o),
+                      "--label", lb, "--clip", c], timeout=1800)
+        log(f"lidar_ext {lb} {c} rc={rc} {out.strip()[-160:]}")
+
+
 def publish(rem, excl, fails, q, final=False):
     rem = list(rem)
+    lidar_ext()
     sh(["env", "OPENBLAS_NUM_THREADS=4", PY, "-I", str(JF / "convergence_check.py"), "--out-md", str(DST / "baselines/CONVERGENCE.md"),
         "--out-json", str(DST / "baselines/convergence.json")], timeout=1800)
     viz_index()

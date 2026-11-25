@@ -11,7 +11,8 @@ import argparse, json, time
 from pathlib import Path
 
 R = Path("/capstor/scratch/cscs/yitiwang/ncf-crop-ablation/results_final")
-CLIPS = ["NFF-02", "NFF-08", "NFF-10"]
+FOG = ["NFF-02", "NFF-08", "NFF-10"]
+CLIPS = FOG + ["NFF-05"]   # NFF-05 = night / dark weather, reported separately (not in the fog mean)
 
 
 def load(p):
@@ -51,8 +52,6 @@ ROWS = [  # (name, group, iters, path fn, convergence key fn) -- the FAIR compar
     ("NeuRAD (standard, corrected bench)", "SOTA", "30k", ext("std", "neurad"), lambda c: "neurad"),
     ("UniSim (corrected bench, no ray drop; schedule x1.5)", "SOTA", "30k", ext("std", "unisim"), lambda c: "unisim"),
     ("EmerNeRF (corrected bench)", "SOTA", "30k", ext("std", "emernerf"), lambda c: "emernerf"),
-    ("FoggyField V1.3 BRDF + LiDAR (F)", "ours", "30k", v13("V13-F30k"), v13key("V13-F30k")),
-    ("FoggyField V1.3 Colour + LiDAR (Fc)", "ours", "30k", v13("V13-Fc30k"), v13key("V13-Fc30k")),
 ]
 ROWS_5K = [  # earlier 5k-step lanes: NOT budget-matched, appendix only
     ("NeuRAD A0 (V1.3 suite, 5k)", "ours-suite", "5k", v13("A0"), v13key("A0")),
@@ -73,6 +72,14 @@ METRICS = [  # (label, kind, key, higher_better, digits)
     ("PSNR ↑", "rgb", "psnr", True, 2), ("SSIM ↑", "rgb", "ssim", True, 3), ("LPIPS ↓", "rgb", "lpips", False, 3),
     ("LiDAR CD (m) ↓", "lidar", "cd_returns_m", False, 3), ("CD² (m²) ↓", "lidar", "cd2_returns_m2", False, 2),
     ("depth median |Δr| (m) ↓", "lidar", "depth_median_l2_returns_m", False, 3),
+    ("LiDAR accuracy pred→GT (m) ↓", "ext", "acc_m", False, 3),
+    ("LiDAR completeness GT→pred (m) ↓", "ext", "comp_m", False, 3),
+    ("LiDAR F-score @0.2 m ↑", "ext", "F@0.2", True, 3),
+    ("LiDAR occupancy IoU @0.2 m voxels ↑", "ext", "occ_iou@0.2", True, 3),
+    ("LiDAR occupancy IoU @0.5 m voxels ↑", "ext", "occ_iou@0.5", True, 3),
+    ("LiDAR range MAE (m) ↓", "ext", "range_mae_m", False, 3),
+    ("LiDAR intensity RMSE (all returns, /255) ↓", "ext", "int_rmse", False, 4),
+    ("LiDAR intensity RMSE (unsaturated returns, /255) ↓", "ext", "int_rmse_unsat", False, 4),
 ]
 
 
@@ -80,6 +87,13 @@ def value(fn, c, kind, key, min_iters=0):
     mp, lp = fn(c)
     if min_iters and int((load(mp) or {}).get("iters") or 0) < min_iters - 1:
         return None          # e.g. the superseded 20k UniSim / 25k EmerNeRF results
+    if kind == "ext":   # jobs/final/lidar_extended.py result next to the LiDAR JSON
+        import re as _re
+        xp = Path(_re.sub(r"/lidar/lidar_v13__", "/lidar_ext/lidar_ext__", str(lp)))
+        if "/v13/" not in str(lp):
+            xp = Path(_re.sub(r"/lidar/lidar_([a-z]+)_safe__", r"/lidar_ext/lidar_ext__\1__", str(lp)))
+        d = load(xp)
+        return None if d is None else d.get(key)
     if kind == "rgb":
         d = load(mp)
         return None if d is None else d.get("primary", {}).get(key)
@@ -116,16 +130,17 @@ def main():
                 col = []
                 for r in rows:
                     v = vals[(r[0], c)] if c != "mean" else (
-                        sum(vals[(r[0], k)] for k in CLIPS) / 3 if all(vals[(r[0], k)] is not None for k in CLIPS) else None)
+                        sum(vals[(r[0], k)] for k in FOG) / 3 if all(vals[(r[0], k)] is not None for k in FOG) else None)
                     if v is not None:
                         col.append(v)
                 best[c] = (max(col) if hb else min(col)) if col else None
-            res += [f"### {label}", "", "| method | group | steps | " + " | ".join(CLIPS) + " | mean (3 clips) |",
+            res += [f"### {label}", "", "| method | group | steps | " + " | ".join(c + (" (night)" if c == "NFF-05" else "") for c in CLIPS) + " | mean (3 fog clips) |",
                     "|---|---|---|" + "---|" * (len(CLIPS) + 1)]
             for r in rows:
                 cells = []
                 vs = [vals[(r[0], c)] for c in CLIPS]
-                mean = sum(vs) / 3 if all(v is not None for v in vs) else None
+                fv = [vals[(r[0], c)] for c in FOG]
+                mean = sum(fv) / 3 if all(v is not None for v in fv) else None
                 for c, v in list(zip(CLIPS, vs)) + [("mean", mean)]:
                     if v is None:
                         cells.append("n/a")
@@ -163,7 +178,7 @@ def main():
                 cells.append("n/a")
         out.append(f"| {r[0]} | " + " | ".join(cells) + f" | {tot:.2f} h |" if tot else f"| {r[0]} | " + " | ".join(cells) + " | n/a |")
     out.append("")
-    out += tables(ROWS_5K, 0, "## Appendix — earlier V1.3 lanes at 5k steps (NOT budget-matched; for reference only)")
+    out += tables(ROWS_5K, 0, "## Appendix (records) — our earlier FoggyField V1.3 lanes at 5k steps (NOT budget-matched; V1.3 paused 2026-11-25, baselines only)")
     a.out.write_text("\n".join(out) + "\n")
     print(f"wrote {a.out}")
 

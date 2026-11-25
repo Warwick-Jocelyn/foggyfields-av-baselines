@@ -27,7 +27,7 @@ from tfevents import read_scalars  # noqa: E402
 
 BW = Path("/capstor/scratch/cscs/yitiwang/ncf-crop-ablation")
 O, R = BW / "outputs_final", BW / "results_final"
-CLIPS = ["NFF-02", "NFF-08", "NFF-10"]
+CLIPS = ["NFF-02", "NFF-08", "NFF-10", "NFF-05"]
 V13CFG = {  # label -> clip -> run dir (config.yml parent); from RESULTS_LANES.md / v13_queue.txt
 }
 

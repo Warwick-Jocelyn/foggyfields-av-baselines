@@ -16,11 +16,11 @@ cd "$REPO" || exit 1
 rsync -a --delete --exclude '__pycache__' --exclude 'core*' --exclude '*.bak*' --exclude '*.log' --exclude '.plan_*' \
       --exclude '.viz3d_enabled' --exclude '*.new' "$BW/jobs/" bench/ncf_crop_ablation_jobs/
 PATHS=(bench)
-if [ "$MODE" = final ]; then
+if [ "$MODE" = final ] || [ "$MODE" = interim ]; then
   R=results/final_ablation_2026-11; mkdir -p "$R/metrics"
   cp "$DST/FINAL_TABLE.md" "$R/README.md"
   cp "$DST/baselines/CONVERGENCE.md" "$DST/baselines/convergence.json" "$DST/baselines/RESULTS_BASELINES.md" "$R/" 2>/dev/null
-  for tag in allfix opreg5e4 std v13; do for k in metrics lidar; do
+  for tag in allfix opreg5e4 std v13; do for k in metrics lidar lidar_ext; do
     for f in "$BW"/results_final/$tag/$k/*.json; do [ -f "$f" ] && cp "$f" "$R/metrics/${tag}__$(basename "$f")"; done; done; done
   # visual example 1: GT vs every method, held-out frame 99, NFF-02 front wide (one JPEG, ~150 KB)
   [ -f "$DST/figures/NFF-02__frame_0099__front_wide_120fov.jpg" ] && \
@@ -46,11 +46,15 @@ EOF
 fi
 git add -- "${PATHS[@]}"
 if git diff --cached --quiet; then log "nothing to commit"; else
-  MSG="final ablation: $( [ "$MODE" = final ] && echo 'SOTA baseline results (NFF-02/08/10, one common evaluator, convergence-checked) + visual example' || echo 'bench harness snapshot (supervisor, 3D orbit viz, convergence check, EmerNeRF env self-repair)')"
+  case "$MODE" in
+    final)   MSG="final ablation: SOTA baseline results (NFF-02/08/10 + NFF-05 night, 30k fair budget, one common evaluator, convergence-checked) + visual example";;
+    interim) MSG="final ablation (INTERIM, runs still training): current baseline tables incl. extended LiDAR metrics, convergence report, V1.3 5k records";;
+    *)       MSG="final ablation: bench harness snapshot (supervisor, fair 30k budget, extended LiDAR metrics, NFF-05)";;
+  esac
   git commit -q -m "$MSG
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01PH1H2K9QFoGyai6uv3GGNm" -- "${PATHS[@]}" || { log "commit failed"; exit 1; }
+Claude-Session: https://claude.ai/code/session_01PHWvFiUFWsbdQfZzeH88Et" -- "${PATHS[@]}" || { log "commit failed"; exit 1; }
   log "committed $(git log --oneline -1)"
 fi
 for try in 1 2 3; do
