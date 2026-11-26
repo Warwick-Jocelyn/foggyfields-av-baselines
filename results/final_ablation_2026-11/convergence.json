@@ -117,6 +117,84 @@
   "verdict": "PASS"
  },
  {
+  "method": "unisim",
+  "variant": "std",
+  "clip": "NFF-02",
+  "iters": 30000,
+  "heldout_psnr": 31.72398443070669,
+  "sec_per_step": 0.18152768164873123,
+  "train_compute_h": 1.5127306804060936,
+  "train_wall_h": 1.6713888888888888,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29990
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 3000
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.04990115575492382,
+    "loss_70_80": 0.01714241597801447,
+    "loss_last10": 0.015520389657467604,
+    "rel_drop_last": 0.09462063705764405
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 31.134867668151855,
+    "gap_db": -0.5891167625548341
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9915772676467896,
+    "detail_ratio": 1.4300616979599,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "emernerf",
+  "variant": "std",
+  "clip": "NFF-02",
+  "iters": 30000,
+  "heldout_psnr": 37.018161385606376,
+  "sec_per_step": 0.35187199999999996,
+  "train_compute_h": 2.932266666666666,
+  "train_wall_h": 0.6322222222222222,
+  "checks": {
+   "C1_finished": {
+    "ok": false,
+    "last_step": 11800
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 10
+   },
+   "C3_plateau": {
+    "ok": false,
+    "loss_first10": NaN,
+    "loss_70_80": NaN,
+    "loss_last10": NaN,
+    "rel_drop_last": NaN
+   },
+   "C4_gap": {
+    "ok": false,
+    "train_psnr_last10": NaN,
+    "gap_db": NaN
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9924819469451904,
+    "detail_ratio": 1.0837607383728027,
+    "n_images": 21
+   }
+  },
+  "verdict": "FAIL"
+ },
+ {
   "method": "splatad",
   "variant": "allfix",
   "clip": "NFF-08",
@@ -189,6 +267,123 @@
     "ok": false,
     "contrast_ratio": 0.9375438094139099,
     "detail_ratio": 0.4584256112575531,
+    "n_images": 21
+   }
+  },
+  "verdict": "FAIL"
+ },
+ {
+  "method": "neurad",
+  "variant": "std",
+  "clip": "NFF-08",
+  "iters": 30000,
+  "heldout_psnr": 33.34224677808357,
+  "sec_per_step": 0.13501093536615372,
+  "train_compute_h": 1.125091128051281,
+  "train_wall_h": 1.2930555555555556,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29900
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 300
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.06282065249979496,
+    "loss_70_80": 0.032590294256806374,
+    "loss_last10": 0.032342372462153435,
+    "rel_drop_last": 0.007607227866657301
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 35.673866271972656,
+    "gap_db": 2.331619493889086
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9867166876792908,
+    "detail_ratio": 1.3377405405044556,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "unisim",
+  "variant": "std",
+  "clip": "NFF-08",
+  "iters": 30000,
+  "heldout_psnr": 32.20501483295215,
+  "sec_per_step": 0.17758595943450928,
+  "train_compute_h": 1.4798829952875774,
+  "train_wall_h": 1.5725,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29990
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 3000
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.027561495080590248,
+    "loss_70_80": 0.011216737795621157,
+    "loss_last10": 0.010539500042796135,
+    "rel_drop_last": 0.06037742569763956
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 31.553845405578613,
+    "gap_db": -0.6511694273735387
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 1.0164010524749756,
+    "detail_ratio": 1.4782627820968628,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "emernerf",
+  "variant": "std",
+  "clip": "NFF-08",
+  "iters": 30000,
+  "heldout_psnr": 36.706432303997,
+  "sec_per_step": 0.35192,
+  "train_compute_h": 2.932666666666667,
+  "train_wall_h": 0.6208333333333333,
+  "checks": {
+   "C1_finished": {
+    "ok": false,
+    "last_step": 12200
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 12
+   },
+   "C3_plateau": {
+    "ok": false,
+    "loss_first10": NaN,
+    "loss_70_80": NaN,
+    "loss_last10": NaN,
+    "rel_drop_last": NaN
+   },
+   "C4_gap": {
+    "ok": false,
+    "train_psnr_last10": NaN,
+    "gap_db": NaN
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9947147369384766,
+    "detail_ratio": 1.1030174493789673,
     "n_images": 21
    }
   },
@@ -271,6 +466,279 @@
    }
   },
   "verdict": "PASS"
+ },
+ {
+  "method": "neurad",
+  "variant": "std",
+  "clip": "NFF-10",
+  "iters": 30000,
+  "heldout_psnr": 33.00863850581182,
+  "sec_per_step": 0.13240134716033936,
+  "train_compute_h": 1.1033445596694946,
+  "train_wall_h": 1.1402777777777777,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29900
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 300
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.09350455179810524,
+    "loss_70_80": 0.049245474860072136,
+    "loss_last10": 0.04910269007086754,
+    "rel_drop_last": 0.002899449941549174
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 33.309316635131836,
+    "gap_db": 0.30067812932001914
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9928657412528992,
+    "detail_ratio": 1.0999356508255005,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "unisim",
+  "variant": "std",
+  "clip": "NFF-10",
+  "iters": 30000,
+  "heldout_psnr": 30.354876032467356,
+  "sec_per_step": 0.18694335222244263,
+  "train_compute_h": 1.5578612685203552,
+  "train_wall_h": 1.6058333333333332,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29990
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 3000
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.10050823539495468,
+    "loss_70_80": 0.05210398882627487,
+    "loss_last10": 0.04866292513906956,
+    "rel_drop_last": 0.06604223140532503
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 30.138360023498535,
+    "gap_db": -0.21651600896882073
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9563846588134766,
+    "detail_ratio": 1.166095495223999,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "emernerf",
+  "variant": "std",
+  "clip": "NFF-10",
+  "iters": 30000,
+  "heldout_psnr": 34.63909859815545,
+  "sec_per_step": 0.351109,
+  "train_compute_h": 2.9259083333333336,
+  "train_wall_h": 0.6275,
+  "checks": {
+   "C1_finished": {
+    "ok": false,
+    "last_step": 12200
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 12
+   },
+   "C3_plateau": {
+    "ok": false,
+    "loss_first10": NaN,
+    "loss_70_80": NaN,
+    "loss_last10": NaN,
+    "rel_drop_last": NaN
+   },
+   "C4_gap": {
+    "ok": false,
+    "train_psnr_last10": NaN,
+    "gap_db": NaN
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.98598313331604,
+    "detail_ratio": 1.3976001739501953,
+    "n_images": 21
+   }
+  },
+  "verdict": "FAIL"
+ },
+ {
+  "method": "splatad",
+  "variant": "allfix",
+  "clip": "NFF-05",
+  "iters": 30000,
+  "heldout_psnr": 30.342802033967956,
+  "sec_per_step": 0.11637966334819794,
+  "train_compute_h": 0.9698305279016495,
+  "train_wall_h": 1.2802777777777778,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29990
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 3000
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.06702686473727226,
+    "loss_70_80": 0.024031028151512146,
+    "loss_last10": 0.02346006128937006,
+    "rel_drop_last": 0.02375956861030759
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 31.067934036254883,
+    "gap_db": 0.7251320022869265
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9923720359802246,
+    "detail_ratio": 0.6926868557929993,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "neurad",
+  "variant": "std",
+  "clip": "NFF-05",
+  "iters": 30000,
+  "heldout_psnr": 29.732483243185378,
+  "sec_per_step": 0.14182332903146744,
+  "train_compute_h": 1.1818610752622287,
+  "train_wall_h": 1.2177777777777778,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29900
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 300
+   },
+   "C3_plateau": {
+    "ok": true,
+    "loss_first10": 0.0947706289589405,
+    "loss_70_80": 0.05615824833512306,
+    "loss_last10": 0.05622652359306812,
+    "rel_drop_last": -0.001215765447982453
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 30.635796546936035,
+    "gap_db": 0.9033133037506573
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9783461689949036,
+    "detail_ratio": 1.1681803464889526,
+    "n_images": 21
+   }
+  },
+  "verdict": "PASS"
+ },
+ {
+  "method": "unisim",
+  "variant": "std",
+  "clip": "NFF-05",
+  "iters": 30000,
+  "heldout_psnr": 9.092774395302778,
+  "sec_per_step": 0.1669265478849411,
+  "train_compute_h": 1.3910545657078426,
+  "train_wall_h": 1.5822222222222222,
+  "checks": {
+   "C1_finished": {
+    "ok": true,
+    "last_step": 29990
+   },
+   "C2_finite": {
+    "ok": false,
+    "n_points": 3000
+   },
+   "C3_plateau": {
+    "ok": false,
+    "loss_first10": 0.1507999449968338,
+    "loss_70_80": NaN,
+    "loss_last10": NaN,
+    "rel_drop_last": NaN
+   },
+   "C4_gap": {
+    "ok": false,
+    "train_psnr_last10": NaN,
+    "gap_db": NaN
+   },
+   "C5_not_grey": {
+    "ok": false,
+    "contrast_ratio": 0.0,
+    "detail_ratio": 0.0,
+    "n_images": 21
+   }
+  },
+  "verdict": "FAIL"
+ },
+ {
+  "method": "emernerf",
+  "variant": "std",
+  "clip": "NFF-05",
+  "iters": 30000,
+  "heldout_psnr": 30.298717352907033,
+  "sec_per_step": 0.352259,
+  "train_compute_h": 2.9354916666666666,
+  "train_wall_h": 0.2288888888888889,
+  "checks": {
+   "C1_finished": {
+    "ok": false,
+    "last_step": 28000
+   },
+   "C2_finite": {
+    "ok": true,
+    "n_points": 91
+   },
+   "C3_plateau": {
+    "ok": false,
+    "loss_first10": NaN,
+    "loss_70_80": 250.567108,
+    "loss_last10": 355.0898895,
+    "rel_drop_last": -0.4171448612481094
+   },
+   "C4_gap": {
+    "ok": true,
+    "train_psnr_last10": 31.673484000000002,
+    "gap_db": 1.3747666470929687
+   },
+   "C5_not_grey": {
+    "ok": true,
+    "contrast_ratio": 0.9842400550842285,
+    "detail_ratio": 1.1148873567581177,
+    "n_images": 21
+   }
+  },
+  "verdict": "FAIL"
  },
  {
   "method": "v13-A0",
